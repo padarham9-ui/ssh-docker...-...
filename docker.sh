@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# v1.1
 # sudo bash vps-box.sh setup
 # sudo bash vps-box.sh add                 (نام و پورت رندوم + کلید خودکار + لینک sshx)
 # sudo RAM=256m DISK=5G bash vps-box.sh add NAME PORT /path/user.pub
-# sudo bash vps-box.sh del NAME            (با PURGE=1 ولوم هم حذف می‌شود)
+# sudo bash vps-box.sh del NAME            (با PURGE=1 ولوم/دیسک هم حذف می‌شود)
 # sudo bash vps-box.sh bw NAME UP DOWN     (تغییر پهنای باند؛ مثال: bw web 5mbit 20mbit ، off = نامحدود)
 # sudo bash vps-box.sh bw NAME             (نمایش محدودیت فعلی)
 set -euo pipefail
@@ -11,10 +12,12 @@ set -euo pipefail
 RAM="${RAM:-256m}"                 # مثال: 64m, 256m, 1g
 CPU_CORES="${CPU_CORES:-1}"        # تعداد هسته
 CPU_PERCENT="${CPU_PERCENT:-20}"   # درصد از آن هسته‌ها
-DISK="${DISK:-2G}"                   # مثال: 20G  (خالی = بدون محدودیت؛ نیاز به overlay2 روی xfs با pquota)
+DISK="${DISK:-2G}"                 # مثال: 20G (خالی = بدون محدودیت)
+                                   # اگر overlay2+xfs+pquota باشد از quota داکر استفاده می‌شود،
+                                   # وگرنه خودکار یک دیسک loop (ext4) با همین سایز برای /root ساخته می‌شود
 PIDS="${PIDS:-100}"                # حداکثر تعداد پروسس برای هر کانتینر
 SUBNET="${SUBNET:-172.30.0.0/24}"  # ساب‌نت شبکه (اگر با شبکه دیگری تداخل داشت عوض کن)
-PURGE="${PURGE:-1}"                # برای del: 1 = ولوم هم حذف شود (پیش‌فرض)، 0 = ولوم بماند
+PURGE="${PURGE:-1}"                # برای del: 1 = ولوم/دیسک هم حذف شود (پیش‌فرض)، 0 = بماند
 BW_UP="${BW_UP:-45mbit}"           # سقف آپلود (خروجی کانتینر)  مثال: 512kbit, 10mbit, 1gbit ; off = نامحدود
 BW_DOWN="${BW_DOWN:-50mbit}"       # سقف دانلود (ورودی کانتینر) مثال: 512kbit, 10mbit, 1gbit ; off = نامحدود
 # ============================================================
@@ -26,6 +29,9 @@ LABEL=vps-box
 SELF=/usr/local/sbin/vps-box.sh
 BWDIR=/etc/vps-box/bw.d
 KEYDIR=$DIR/keys
+DISKDIR=/var/lib/vps-box/disks     # فایل‌های img دیسک loop
+LOOPMNT=/var/lib/vps-box/mnt       # محل mount دیسک‌ها
+QUOTA_OK=""
 
 die()  { echo "[خطا] $*" >&2; exit 1; }
 warn() { echo "[هشدار] $*" >&2; }
@@ -79,7 +85,6 @@ validate_limits() {
 }
 
 # ---------- محدودیت پهنای باند (tc روی veth سمت هاست) ----------
-# بررسی مقدار: off/0 یا عدد + kbit|mbit|gbit
 valid_rate() { [[ "$1" =~ ^(off|0|[1-9][0-9]*(kbit|mbit|gbit))$ ]]; }
 is_off()     { [ "$1" = off ] || [ "$1" = 0 ]; }
 
@@ -94,7 +99,6 @@ to_kbit() {
 }
 
 # burst (بایت) ≈ 256ms ترافیک، حداقل 70000 بایت
-# (باید از بزرگ‌ترین پکت GSO/TSO یعنی ~64KB بزرگ‌تر باشد وگرنه پکت‌ها دراپ می‌شوند)
 burst_for() {
   local k b
   k=$(to_kbit "$1")
@@ -103,7 +107,6 @@ burst_for() {
   echo "$b"
 }
 
-# نام veth سمت هاست برای یک کانتینر
 veth_of() {
   local pid idx f
   pid=$(docker inspect -f '{{.State.Pid}}' "$1" 2>/dev/null) || return 1
@@ -124,7 +127,7 @@ veth_of() {
   return 1
 }
 
-bw_conf_read() {  # NAME -> UP/DOWN را در متغیرهای سراسری cur_up/cur_down می‌گذارد
+bw_conf_read() {
   cur_up=off; cur_down=off
   local UP="" DOWN=""
   if [ -f "$BWDIR/$1" ]; then
@@ -135,12 +138,11 @@ bw_conf_read() {  # NAME -> UP/DOWN را در متغیرهای سراسری cur_
   [ -z "${DOWN:-}" ] || cur_down=$DOWN
 }
 
-bw_conf_write() {  # NAME UP DOWN
+bw_conf_write() {
   mkdir -p "$BWDIR"
   printf 'UP=%s\nDOWN=%s\n' "$2" "$3" > "$BWDIR/$1"
 }
 
-# اعمال محدودیت روی veth کانتینر (idempotent)
 bw_apply() {
   local name=$1 v b
   command -v tc >/dev/null || { warn "tc نصب نیست؛ پهنای باند محدود نشد"; return 1; }
@@ -152,7 +154,6 @@ bw_apply() {
   modprobe cls_u32 2>/dev/null || true
   modprobe act_police 2>/dev/null || true
 
-  # دانلود (ترافیک به سمت کانتینر) = egress روی veth → shaping با tbf
   tc qdisc del dev "$v" root 2>/dev/null || true
   if ! is_off "$cur_down"; then
     b=$(burst_for "$cur_down")
@@ -160,8 +161,6 @@ bw_apply() {
       || { warn "اعمال محدودیت دانلود روی $v شکست خورد"; return 1; }
   fi
 
-  # آپلود (ترافیک از کانتینر) = ingress روی veth → policing
-  # mtu 65535: بدون آن پکت‌های بزرگ‌تر از ~2KB (GSO) همیشه دراپ می‌شوند
   tc qdisc del dev "$v" ingress 2>/dev/null || true
   if ! is_off "$cur_up"; then
     b=$(burst_for "$cur_up")
@@ -181,11 +180,9 @@ bw_apply_all() {
   done < <(docker ps --filter "label=$LABEL=1" --format '{{.Names}}')
 }
 
-# با هر start کانتینر (ریبوت، ریستارت، بالا آمدن داکر) محدودیت دوباره اعمال شود
 bw_watch() {
   docker info >/dev/null 2>&1 || die "داکر در حال اجرا نیست"
   local n
-  # هم‌زمان با شروع شنود رویدادها، کانتینرهای در حال اجرا را هم اعمال کن (جلوگیری از race)
   ( sleep 3; bw_apply_all ) &
   while read -r n; do
     [ -n "$n" ] || continue
@@ -221,6 +218,7 @@ install_deps() {
   command -v awk        >/dev/null || pk+=(gawk)
   command -v iptables   >/dev/null || pk+=(iptables)
   command -v grep       >/dev/null || pk+=(grep)
+  command -v mkfs.ext4  >/dev/null || pk+=(e2fsprogs)
   if ! command -v tc >/dev/null || ! command -v ip >/dev/null; then
     if [ "$PM" = apt ]; then pk+=(iproute2); else pk+=(iproute iproute-tc); fi
   fi
@@ -254,8 +252,6 @@ get_subnet() {
   echo "${s:-$SUBNET}"
 }
 
-# فایروال: فقط جلوگیری از دسترسی به شبکه‌های داخلی/اسپم SMTP.
-# هیچ محدودیتی روی تعداد اتصال‌ها وجود ندارد (کنترل مصرف فقط با پهنای باند انجام می‌شود).
 firewall() {
   command -v iptables >/dev/null || die "iptables نصب نیست"
   docker info >/dev/null 2>&1   || die "داکر در حال اجرا نیست"
@@ -283,7 +279,6 @@ firewall() {
     ipt -I INPUT -s "$SUB" -m conntrack --ctstate NEW -j DROP
 }
 
-# قوانین فایروال بعد از ریبوت و بعد از بالا آمدن داکر دوباره اعمال شوند
 persist_firewall() {
   if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$SELF" ]; then
     install -m 755 "$0" "$SELF"
@@ -338,7 +333,6 @@ userns_active() {
 }
 
 enable_userns() {
-  # user namespace: روت کانتینر = یوزر بی‌اختیار روی هاست
   if userns_active; then
     echo "[ok] userns-remap فعال است"
     return 0
@@ -361,6 +355,57 @@ enable_userns() {
   else
     warn "userns-remap اعمال نشد (ممکن است با image store فعلی داکر ناسازگار باشد)"
   fi
+}
+
+# ---------- محدودیت دیسک ----------
+# آیا quota داکر (--storage-opt size) روی این سرور کار می‌کند؟ (فقط overlay2 روی xfs با pquota)
+quota_supported() {
+  if [ -z "$QUOTA_OK" ]; then
+    if docker run --rm --storage-opt "size=$DISK" --entrypoint true "$IMG" >/dev/null 2>&1; then
+      QUOTA_OK=1
+    else
+      QUOTA_OK=0
+    fi
+  fi
+  [ "$QUOTA_OK" = 1 ]
+}
+
+# ساخت دیسک loop (ext4) با سایز DISK و mount روی $LOOPMNT/NAME
+make_loop_disk() {
+  local name=$1 img mnt uid=0 gid=0
+  img="$DISKDIR/$name.img"
+  mnt="$LOOPMNT/$name"
+  command -v mkfs.ext4 >/dev/null || install_deps
+  command -v mkfs.ext4 >/dev/null || { warn "mkfs.ext4 نصب نیست"; return 1; }
+  mkdir -p "$DISKDIR" "$mnt"
+  [ ! -e "$img" ] || { warn "فایل $img از قبل وجود دارد"; return 1; }
+  truncate -s "$DISK" "$img"                        || { warn "ساخت فایل دیسک شکست خورد (فضای کافی؟)"; rm -f "$img"; return 1; }
+  mkfs.ext4 -q -F -m 0 "$img" >/dev/null 2>&1       || { warn "mkfs.ext4 شکست خورد"; rm -f "$img"; return 1; }
+  mount -o loop "$img" "$mnt"                       || { warn "mount دیسک loop شکست خورد (ماژول loop؟)"; rm -f "$img"; return 1; }
+  if userns_active; then
+    uid=$(awk -F: '$1=="dockremap"{print $2; exit}' /etc/subuid 2>/dev/null || true)
+    gid=$(awk -F: '$1=="dockremap"{print $2; exit}' /etc/subgid 2>/dev/null || true)
+    uid=${uid:-0}; gid=${gid:-0}
+  fi
+  chown "$uid:$gid" "$mnt"
+  chmod 700 "$mnt"
+  # بعد از ریبوت خودکار mount شود (قبل از بالا آمدن کانتینرها)
+  grep -qF "$img " /etc/fstab 2>/dev/null || echo "$img $mnt ext4 loop,nofail 0 0" >> /etc/fstab
+  return 0
+}
+
+remove_loop_disk() {
+  local name=$1 img mnt
+  img="$DISKDIR/$name.img"
+  mnt="$LOOPMNT/$name"
+  mountpoint -q "$mnt" 2>/dev/null && { umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true; }
+  if [ -f /etc/fstab ]; then
+    grep -vF "$img " /etc/fstab > /etc/fstab.vpsbox.tmp || true
+    cat /etc/fstab.vpsbox.tmp > /etc/fstab
+    rm -f /etc/fstab.vpsbox.tmp
+  fi
+  rm -f "$img"
+  rmdir "$mnt" 2>/dev/null || true
 }
 
 setup() {
@@ -540,7 +585,6 @@ add() {
   fi
   rm -f "$tmp"
 
-  # اگر هنوز setup نشده، خودکار انجام بده
   if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1 \
      || ! docker image inspect "$IMG" >/dev/null 2>&1 \
      || ! docker network inspect "$NET" >/dev/null 2>&1; then
@@ -558,26 +602,47 @@ add() {
   local CPUS
   CPUS=$(awk -v c="$CPU_CORES" -v p="$CPU_PERCENT" 'BEGIN{printf "%.2f", c*p/100}')
   awk -v x="$CPUS" 'BEGIN{exit !(x>=0.01)}' || die "سهم CPU خیلی کم است ($CPUS)"
-  echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=${DISK:-نامحدود}"
 
-  local created_vol=0
+  # ---- انتخاب روش محدودیت دیسک ----
+  local DISKMODE=volume
+  if [ -n "$DISK" ]; then
+    if quota_supported; then
+      DISKMODE=quota
+    else
+      DISKMODE=loop
+    fi
+  fi
+  case "$DISKMODE" in
+    quota)  echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=$DISK (quota داکر)" ;;
+    loop)   echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=$DISK (دیسک loop برای /root؛ quota داکر روی این سرور پشتیبانی نمی‌شود)" ;;
+    volume) echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=نامحدود" ;;
+  esac
+
+  local created_vol=0 created_loop=0
   local args=(-d --name "$NAME" --hostname "$NAME" --label "$LABEL=1"
               --init --restart unless-stopped
               --network "$NET"
               -p "0.0.0.0:${PORT}:2222"
               -e "SSH_PUBKEY=$PUBKEY")
 
-  if [ -z "$DISK" ]; then
-    if ! docker volume inspect "${NAME}_root" >/dev/null 2>&1; then
-      docker volume create --label "$LABEL=1" "${NAME}_root" >/dev/null
-      created_vol=1
-    fi
-    args+=(-v "${NAME}_root:/root")
-  else
-    args+=(--storage-opt "size=$DISK")
-  fi
+  case "$DISKMODE" in
+    quota)
+      args+=(--storage-opt "size=$DISK")
+      ;;
+    loop)
+      make_loop_disk "$NAME" || die "ساخت دیسک loop شکست خورد"
+      created_loop=1
+      args+=(-v "$LOOPMNT/$NAME:/root")
+      ;;
+    volume)
+      if ! docker volume inspect "${NAME}_root" >/dev/null 2>&1; then
+        docker volume create --label "$LABEL=1" "${NAME}_root" >/dev/null
+        created_vol=1
+      fi
+      args+=(-v "${NAME}_root:/root")
+      ;;
+  esac
 
-  # بدون --ulimit nproc: با userns-remap این مقدار بین همه کانتینرها مشترک می‌شود؛ --pids-limit کافی است
   args+=(--cap-drop=ALL
          --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=FSETID
          --cap-add=SETUID --cap-add=SETGID --cap-add=KILL --cap-add=SYS_CHROOT
@@ -591,7 +656,7 @@ add() {
   if ! docker run "${args[@]}" "$IMG" >/dev/null; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     if [ "$created_vol" -eq 1 ]; then docker volume rm "${NAME}_root" >/dev/null 2>&1 || true; fi
-    [ -z "$DISK" ] || warn "محدودیت DISK فقط روی overlay2 با xfs و pquota کار می‌کند"
+    if [ "$created_loop" -eq 1 ]; then remove_loop_disk "$NAME"; fi
     if [ "$GENKEY" -eq 1 ]; then rm -f "$PRIV" "$PRIV.pub"; fi
     die "ساخت کانتینر شکست خورد"
   fi
@@ -625,6 +690,15 @@ del() {
       echo "[ok] volume هم حذف شد"
     else
       echo "volume باقی ماند. حذف کامل: docker volume rm ${NAME}_root  (یا PURGE=1)"
+    fi
+  fi
+
+  if [ -f "$DISKDIR/$NAME.img" ]; then
+    if [ "$PURGE" = "1" ]; then
+      remove_loop_disk "$NAME"
+      echo "[ok] دیسک loop هم حذف شد"
+    else
+      echo "دیسک $DISKDIR/$NAME.img باقی ماند (PURGE=1 برای حذف)"
     fi
   fi
 }

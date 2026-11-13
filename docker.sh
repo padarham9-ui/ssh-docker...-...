@@ -2,9 +2,9 @@
 # ------------------------------------------------------------------
 # INSTALL (once; does NOT create a server, it only installs the Docker-ssh-cs command):
 #   sudo bash docker.sh
-#
+# v2
 # After install:
-#   Docker-ssh-cs cr                      create a server (asks RAM / disk / CPU / name)
+#   Docker-ssh-cs cr                      create a server (asks RAM / disk / CPU / bandwidth / name)
 #   Docker-ssh-cs cr -y                   create a server with defaults, no questions
 #   Docker-ssh-cs cr NAME                 create a server with a custom name
 #   Docker-ssh-cs cr NAME PORT PUB_FILE   create with custom name, port and public key file
@@ -128,6 +128,21 @@ show_size() {
   if [ -z "$1" ]; then echo "unlimited"; else echo "${1^^}B"; fi
 }
 
+# "10Mbps" / "10mbit" / "10m" / "10" -> "10mbit" ; "512kbit" -> "512kbit" ; 0/off/none -> "off"
+# (plain number = mbit. "MB" is rejected on purpose: megabytes vs megabits is a factor of 8)
+norm_rate() {
+  local s=${1,,} n u
+  s=${s// /}
+  case "$s" in
+    0|off|none|unlimited|no) echo off; return 0 ;;
+  esac
+  [[ "$s" =~ ^([0-9]+)(([kmg])(bit|bps)?)?$ ]] || return 1
+  n=$((10#${BASH_REMATCH[1]}))
+  u=${BASH_REMATCH[3]:-m}
+  [ "$n" -ge 1 ] || return 1
+  echo "${n}${u}bit"
+}
+
 validate_limits() {
   [[ "$RAM" =~ ^[1-9][0-9]*[kmgKMG]$ ]]               || die "Invalid RAM value: $RAM"
   [[ "$CPU_CORES" =~ ^[0-9]+(\.[0-9]+)?$ ]]           || die "Invalid CPU_CORES value: $CPU_CORES"
@@ -218,6 +233,18 @@ ask_percent() {
       return 0
     fi
     echo "  Invalid value. Enter a number between 1 and 100 (e.g. 25)"
+  done
+}
+
+ask_rate() {   # ask_rate "Question" VARNAME   (sets the variable named VARNAME)
+  local v
+  while true; do
+    ask "$1 (e.g. 10mbit, 512kbit, 1gbit; 0 = unlimited)" "${!2}"
+    if v=$(norm_rate "$ASK_REPLY"); then
+      printf -v "$2" '%s' "$v"
+      return 0
+    fi
+    echo "  Invalid value. Examples: 10mbit, 512kbit, 1gbit, 0  (use bits, not bytes)"
   done
 }
 
@@ -367,9 +394,10 @@ bw_cmd() {
     echo "$NAME: upload=$cur_up download=$cur_down"
     return 0
   fi
-  valid_rate "$2" || die "Invalid UP value (examples: 512kbit, 10mbit, off)"
-  valid_rate "$3" || die "Invalid DOWN value (examples: 512kbit, 10mbit, off)"
-  bw_conf_write "$NAME" "$2" "$3"
+  local UPV DOWNV
+  UPV=$(norm_rate "$2")   || die "Invalid UP value (examples: 10mbit, 512kbit, off)"
+  DOWNV=$(norm_rate "$3") || die "Invalid DOWN value (examples: 10mbit, 512kbit, off)"
+  bw_conf_write "$NAME" "$UPV" "$DOWNV"
   bw_apply "$NAME"
 }
 
@@ -818,6 +846,8 @@ cr() {
   # normalize values coming from environment variables / defaults
   RAM=$(norm_size "$RAM") || die "Invalid RAM value: $RAM"
   if [ -n "$DISK" ]; then DISK=$(norm_size "$DISK") || die "Invalid DISK value: $DISK"; DISK=${DISK^^}; fi
+  BW_UP=$(norm_rate "$BW_UP")     || die "Invalid BW_UP value: $BW_UP (examples: 10mbit, 512kbit, off)"
+  BW_DOWN=$(norm_rate "$BW_DOWN") || die "Invalid BW_DOWN value: $BW_DOWN (examples: 10mbit, 512kbit, off)"
 
   # ---- questions ----
   if [ "$INTERACTIVE" -eq 1 ]; then
@@ -826,6 +856,8 @@ cr() {
     ask_disk
     ask_cores
     ask_percent
+    ask_rate "Upload limit (server -> internet)" BW_UP
+    ask_rate "Download limit (internet -> server)" BW_DOWN
     if [ -z "$NAME" ]; then
       ask_name
       NAME=$NAME_ANSWER
@@ -999,7 +1031,7 @@ de() {
 usage() {
   cat <<EOF
 Usage:
-  $CMD cr                      create a server (asks RAM / disk / CPU / name)
+  $CMD cr                      create a server (asks RAM / disk / CPU / bandwidth / name)
   $CMD cr -y                   create a server with defaults, no questions
   $CMD cr NAME                 create a server with a custom name
   $CMD cr NAME PORT PUB_FILE   create with custom name, port and public key file

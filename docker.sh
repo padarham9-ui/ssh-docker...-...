@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# v1.1
-# sudo bash vps-box.sh setup
-# sudo bash vps-box.sh add                 (نام و پورت رندوم + کلید خودکار + لینک sshx)
-# sudo RAM=256m DISK=5G bash vps-box.sh add NAME PORT /path/user.pub
-# sudo bash vps-box.sh del NAME            (با PURGE=1 ولوم/دیسک هم حذف می‌شود)
-# sudo bash vps-box.sh bw NAME UP DOWN     (تغییر پهنای باند؛ مثال: bw web 5mbit 20mbit ، off = نامحدود)
-# sudo bash vps-box.sh bw NAME             (نمایش محدودیت فعلی)
+# ------------------------------------------------------------------
+# نصب (فقط یک‌بار؛ سرور نمی‌سازد، فقط دستور Docker-ssh-cs را نصب می‌کند):
+#   sudo bash docker.sh
+#
+# بعد از نصب:
+#   Docker-ssh-cs cr                      ساخت سرور (نام/پورت رندوم + کلید خودکار + لینک sshx)
+#   Docker-ssh-cs cr NAME                 ساخت سرور با نام دلخواه
+#   Docker-ssh-cs cr NAME PORT PUB_FILE   ساخت با نام، پورت و کلید عمومی دلخواه
+#   Docker-ssh-cs de NAME                 حذف سرور
+#   Docker-ssh-cs info NAME               اطلاعات یک سرور (لینک sshx، پردازنده، اسم، پورت و ...)
+#   Docker-ssh-cs all info                اطلاعات همه سرورها
+#   Docker-ssh-cs bw NAME UP DOWN         تغییر پهنای باند (off = نامحدود)
+#   Docker-ssh-cs bw NAME                 نمایش پهنای باند فعلی
+#   مثال با تنظیمات: RAM=512m DISK=5G Docker-ssh-cs cr
+# ------------------------------------------------------------------
 set -euo pipefail
 
 # ================== تنظیمات (اینجا عوض کن) ==================
@@ -17,29 +25,39 @@ DISK="${DISK:-2G}"                 # مثال: 20G (خالی = بدون محدو
                                    # وگرنه خودکار یک دیسک loop (ext4) با همین سایز برای /root ساخته می‌شود
 PIDS="${PIDS:-100}"                # حداکثر تعداد پروسس برای هر کانتینر
 SUBNET="${SUBNET:-172.30.0.0/24}"  # ساب‌نت شبکه (اگر با شبکه دیگری تداخل داشت عوض کن)
-PURGE="${PURGE:-1}"                # برای del: 1 = ولوم/دیسک هم حذف شود (پیش‌فرض)، 0 = بماند
+PURGE="${PURGE:-1}"                # برای de: 1 = ولوم/دیسک هم حذف شود (پیش‌فرض)، 0 = بماند
 BW_UP="${BW_UP:-45mbit}"           # سقف آپلود (خروجی کانتینر)  مثال: 512kbit, 10mbit, 1gbit ; off = نامحدود
 BW_DOWN="${BW_DOWN:-50mbit}"       # سقف دانلود (ورودی کانتینر) مثال: 512kbit, 10mbit, 1gbit ; off = نامحدود
 # ============================================================
 
+CMD=Docker-ssh-cs
 DIR=/opt/vps-box
 IMG=vps-box
 NET=vps-net
 LABEL=vps-box
-SELF=/usr/local/sbin/vps-box.sh
+SELF=/usr/local/bin/Docker-ssh-cs
+ALIAS=/usr/local/bin/docker-ssh-cs
+OLDSELF=/usr/local/sbin/vps-box.sh
 BWDIR=/etc/vps-box/bw.d
+META=/etc/vps-box/meta.d
 KEYDIR=$DIR/keys
 DISKDIR=/var/lib/vps-box/disks     # فایل‌های img دیسک loop
 LOOPMNT=/var/lib/vps-box/mnt       # محل mount دیسک‌ها
 QUOTA_OK=""
+PUBIP=""
 
 die()  { echo "[خطا] $*" >&2; exit 1; }
 warn() { echo "[هشدار] $*" >&2; }
 ipt()  { iptables -w "$@"; }
 has_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
 
-[ "$(id -u)" -eq 0 ]        || die "باید root باشی (با sudo اجرا کن)"
 [ "$(uname -s)" = "Linux" ] || die "فقط روی لینوکس کار می‌کند"
+
+# اگر root نیست، خودکار با sudo دوباره اجرا شود
+if [ "$(id -u)" -ne 0 ]; then
+  command -v sudo >/dev/null 2>&1 || die "باید root باشی (با sudo اجرا کن)"
+  exec sudo -E bash "$(readlink -f "$0" 2>/dev/null || echo "$0")" "$@"
+fi
 
 # ---------- تشخیص پکیج‌منیجر ----------
 if   command -v apt-get >/dev/null; then PM=apt
@@ -82,6 +100,17 @@ validate_limits() {
   if [ -n "$DISK" ]; then
     [[ "$DISK" =~ ^[1-9][0-9]*[kKmMgGtT]?$ ]]         || die "مقدار DISK نامعتبر است: $DISK"
   fi
+}
+
+valid_name() { [[ "$1" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; }
+
+# بررسی اینکه کانتینر وجود دارد و توسط همین ابزار ساخته شده
+check_owned() {
+  local NAME=$1 lbl
+  valid_name "$NAME" || die "نام نامعتبر"
+  command -v docker >/dev/null || die "داکر نصب نیست"
+  lbl=$(docker container inspect -f "{{index .Config.Labels \"$LABEL\"}}" "$NAME" 2>/dev/null || true)
+  [ "$lbl" = "1" ] || die "سروری با نام $NAME وجود ندارد یا توسط $CMD ساخته نشده"
 }
 
 # ---------- محدودیت پهنای باند (tc روی veth سمت هاست) ----------
@@ -154,6 +183,7 @@ bw_apply() {
   modprobe cls_u32 2>/dev/null || true
   modprobe act_police 2>/dev/null || true
 
+  # دانلود (ترافیک به سمت کانتینر) = egress روی veth → shaping با tbf
   tc qdisc del dev "$v" root 2>/dev/null || true
   if ! is_off "$cur_down"; then
     b=$(burst_for "$cur_down")
@@ -161,6 +191,7 @@ bw_apply() {
       || { warn "اعمال محدودیت دانلود روی $v شکست خورد"; return 1; }
   fi
 
+  # آپلود (ترافیک از کانتینر) = ingress روی veth → policing
   tc qdisc del dev "$v" ingress 2>/dev/null || true
   if ! is_off "$cur_up"; then
     b=$(burst_for "$cur_up")
@@ -194,12 +225,9 @@ bw_watch() {
 }
 
 bw_cmd() {
-  [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || die "استفاده: $0 bw NAME [UP DOWN]"
-  local NAME=$1 lbl
-  valid_name "$NAME" || die "نام نامعتبر"
-  command -v docker >/dev/null || die "داکر نصب نیست"
-  lbl=$(docker container inspect -f "{{index .Config.Labels \"$LABEL\"}}" "$NAME" 2>/dev/null || true)
-  [ "$lbl" = "1" ] || die "کانتینر $NAME وجود ندارد یا توسط vps-box ساخته نشده"
+  [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || die "استفاده: $CMD bw NAME [UP DOWN]"
+  local NAME=$1
+  check_owned "$NAME"
 
   if [ "$#" -eq 1 ]; then
     bw_conf_read "$NAME"
@@ -252,6 +280,7 @@ get_subnet() {
   echo "${s:-$SUBNET}"
 }
 
+# فایروال: فقط جلوگیری از دسترسی به شبکه‌های داخلی/اسپم SMTP.
 firewall() {
   command -v iptables >/dev/null || die "iptables نصب نیست"
   docker info >/dev/null 2>&1   || die "داکر در حال اجرا نیست"
@@ -279,12 +308,23 @@ firewall() {
     ipt -I INPUT -s "$SUB" -m conntrack --ctstate NEW -j DROP
 }
 
-persist_firewall() {
-  if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$SELF" ]; then
-    install -m 755 "$0" "$SELF"
+# نصب خود اسکریپت به‌عنوان دستور Docker-ssh-cs (و docker-ssh-cs با حروف کوچک)
+install_self() {
+  if [ -f "$0" ]; then
+    if [ "$(readlink -f "$0")" != "$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")" ]; then
+      install -m 755 "$0" "$SELF"
+    fi
+    ln -sf "$SELF" "$ALIAS"
+    rm -f "$OLDSELF"
+  elif [ ! -x "$SELF" ]; then
+    warn "اسکریپت به‌صورت فایل اجرا نشده؛ دستور $CMD نصب نشد. اول فایل را دانلود کن و با bash اجرا کن."
   fi
+}
+
+# قوانین فایروال و پهنای باند بعد از ریبوت و بعد از بالا آمدن داکر دوباره اعمال شوند
+persist_firewall() {
   if [ ! -x "$SELF" ]; then
-    warn "اسکریپت به‌صورت فایل اجرا نشده؛ فایروال بعد از ریبوت خودکار برنمی‌گردد (آن را با bash vps-box.sh اجرا کن)"
+    warn "فایروال بعد از ریبوت خودکار برنمی‌گردد (اسکریپت نصب نشده)"
     return 0
   fi
   if ! has_systemd; then
@@ -389,7 +429,7 @@ make_loop_disk() {
   fi
   chown "$uid:$gid" "$mnt"
   chmod 700 "$mnt"
-  # بعد از ریبوت خودکار mount شود (قبل از بالا آمدن کانتینرها)
+  # بعد از ریبوت خودکار mount شود
   grep -qF "$img " /etc/fstab 2>/dev/null || echo "$img $mnt ext4 loop,nofail 0 0" >> /etc/fstab
   return 0
 }
@@ -398,7 +438,9 @@ remove_loop_disk() {
   local name=$1 img mnt
   img="$DISKDIR/$name.img"
   mnt="$LOOPMNT/$name"
-  mountpoint -q "$mnt" 2>/dev/null && { umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true; }
+  if mountpoint -q "$mnt" 2>/dev/null; then
+    umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+  fi
   if [ -f /etc/fstab ]; then
     grep -vF "$img " /etc/fstab > /etc/fstab.vpsbox.tmp || true
     cat /etc/fstab.vpsbox.tmp > /etc/fstab
@@ -408,6 +450,7 @@ remove_loop_disk() {
   rmdir "$mnt" 2>/dev/null || true
 }
 
+# آماده‌سازی داکر/ایمیج/شبکه/فایروال (سرور نمی‌سازد)
 setup() {
   check_virt
   install_deps
@@ -478,12 +521,11 @@ EOF
       || die "ساخت شبکه شکست خورد؛ احتمالاً $SUBNET با شبکه دیگری تداخل دارد (SUBNET را عوض کن)"
   fi
 
+  install_self
   firewall
   persist_firewall
   echo "[ok] setup کامل شد"
 }
-
-valid_name() { [[ "$1" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; }
 
 rand_name() { echo "box-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"; }
 
@@ -500,9 +542,9 @@ rand_port() {
   return 1
 }
 
-get_sshx_link() {
-  local name=$1 i l=""
-  for i in $(seq 1 25); do
+get_sshx_link() {  # NAME [TRIES]
+  local name=$1 tries=${2:-25} i l=""
+  for i in $(seq 1 "$tries"); do
     l=$(docker exec "$name" cat /tmp/sshx.log 2>/dev/null \
         | grep -Eo 'https://sshx\.io/s/[^[:space:][:cntrl:]]+' | head -n1 || true)
     if [ -n "$l" ]; then echo "$l"; return 0; fi
@@ -511,55 +553,129 @@ get_sshx_link() {
   return 1
 }
 
-public_ip() { curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || echo "<IP-VPS>"; }
+get_pubip() {
+  if [ -z "$PUBIP" ]; then
+    PUBIP=$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || echo "<IP-VPS>")
+  fi
+  echo "$PUBIP"
+}
 
-print_info() {  # NAME PORT [PRIVATE_KEY_PATH]
-  local name=$1 port=$2 key=${3:-} pubip link self
-  pubip=$(public_ip)
-  if [ -x "$SELF" ]; then self="sudo $SELF"; else self="sudo bash $0"; fi
-  link=$(get_sshx_link "$name" || true)
+host_cpu_model() {
+  local m=""
+  m=$(lscpu 2>/dev/null | awk -F: '/^Model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}' || true)
+  if [ -z "$m" ]; then
+    m=$(awk -F: '/model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+  fi
+  echo "${m:-نامشخص}"
+}
+
+# ---------- نمایش اطلاعات یک سرور ----------
+info_one() {  # NAME [SSHX_TRIES]
+  local name=$1 tries=${2:-3}
+  local status port nano mem cpus ramv link key pubip cpumodel disk_txt used size
+  local M_DISK="" M_MODE=""
+
+  status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "؟")
+  port=$(docker inspect -f '{{with index .HostConfig.PortBindings "2222/tcp"}}{{(index . 0).HostPort}}{{end}}' "$name" 2>/dev/null || true)
+  nano=$(docker inspect -f '{{.HostConfig.NanoCpus}}' "$name" 2>/dev/null || echo 0)
+  mem=$(docker inspect -f '{{.HostConfig.Memory}}' "$name" 2>/dev/null || echo 0)
+  cpus=$(awk -v n="${nano:-0}" 'BEGIN{printf "%.2f", n/1000000000}')
+  ramv=$(awk -v m="${mem:-0}" 'BEGIN{printf "%d", m/1048576}')
+  cpumodel=$(host_cpu_model)
+  pubip=$(get_pubip)
+
+  # shellcheck disable=SC1090
+  [ -f "$META/$name" ] && . "$META/$name"
+  case "${M_MODE:-}" in
+    loop)
+      disk_txt="${M_DISK:-?} (دیسک loop روی /root)"
+      if mountpoint -q "$LOOPMNT/$name" 2>/dev/null; then
+        read -r used size < <(df -h --output=used,size "$LOOPMNT/$name" 2>/dev/null | tail -n1) || true
+        [ -z "${used:-}" ] || disk_txt="$disk_txt — مصرف: $used از $size"
+      fi ;;
+    quota)  disk_txt="${M_DISK:-?} (quota داکر)" ;;
+    *)      disk_txt="نامحدود" ;;
+  esac
+
+  bw_conf_read "$name"
+
+  key=""
+  [ -f "$KEYDIR/$name" ] && key="$KEYDIR/$name"
+
+  link=""
+  if [ "$status" = "running" ]; then
+    link=$(get_sshx_link "$name" "$tries" || true)
+  fi
+
   echo
   echo "=============================================="
-  echo "پورت : $port"
-  echo "اسم  : $name"
+  echo "اسم         : $name"
+  echo "وضعیت       : $status"
+  echo "پورت SSH    : ${port:-؟}"
+  echo "پردازنده    : $cpus هسته ($(awk -v c="$cpus" 'BEGIN{printf "%d", c*100}')% از یک هسته) | CPU سرور: $cpumodel"
+  echo "رم          : ${ramv}MB"
+  echo "دیسک        : $disk_txt"
+  echo "پهنای باند  : آپلود=$cur_up دانلود=$cur_down"
   echo "----------------------------------------------"
   echo "اتصال با داکر (روی همین سرور):"
   echo "  docker exec -it $name bash"
-  echo "اتصال با SSH (پورت $port را در فایروال/Security Group باز کن):"
+  echo "اتصال با SSH (پورت ${port:-؟} را در فایروال/Security Group باز کن):"
   if [ -n "$key" ]; then
-    echo "  ssh -i $key -p $port root@$pubip"
+    echo "  ssh -i $key -p ${port:-PORT} root@$pubip"
   else
-    echo "  ssh -p $port root@$pubip"
+    echo "  ssh -p ${port:-PORT} root@$pubip"
   fi
-  echo "حذف کانتینر:"
-  echo "  $self del $name"
   echo "لینک sshx:"
   if [ -n "$link" ]; then
     echo "  $link"
   else
-    echo "  (هنوز آماده نشد؛ بعداً: docker exec $name cat /tmp/sshx.log)"
+    echo "  (آماده نیست؛ بعداً: $CMD info $name)"
   fi
+  echo "حذف سرور:"
+  echo "  $CMD de $name"
   echo "=============================================="
 }
 
-add() {
-  local NAME PORT KEY PRIV="" GENKEY=0
-  if [ "$#" -eq 0 ]; then
-    NAME=$(rand_name)
-    PORT=$(rand_port) || die "پورت آزاد پیدا نشد"
-    GENKEY=1
-  elif [ "$#" -eq 3 ]; then
-    NAME=$1; PORT=$2; KEY=$3
+list_names() {
+  docker ps -a --filter "label=$LABEL=1" --format '{{.Names}}' | sort
+}
+
+info_all() {
+  command -v docker >/dev/null || die "داکر نصب نیست"
+  docker info >/dev/null 2>&1 || die "داکر در حال اجرا نیست"
+  local n count=0
+  while read -r n; do
+    [ -n "$n" ] || continue
+    count=$((count + 1))
+    info_one "$n" 3
+  done < <(list_names)
+  if [ "$count" -eq 0 ]; then
+    echo "هیچ سروری وجود ندارد. با «$CMD cr» بساز."
   else
-    die "استفاده: $0 add   یا   $0 add NAME PORT PUBKEY_FILE"
+    echo "تعداد کل سرورها: $count"
   fi
-  if [ "$GENKEY" -eq 1 ]; then
-    install_deps
-    mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR"
-    PRIV="$KEYDIR/$NAME"
-    ssh-keygen -q -t ed25519 -N "" -C "$NAME" -f "$PRIV"
-    KEY="$PRIV.pub"
+}
+
+info_cmd() {
+  if [ "$#" -eq 0 ]; then
+    info_all
+  elif [ "$#" -eq 1 ]; then
+    check_owned "$1"
+    info_one "$1" 5
+  else
+    die "استفاده: $CMD info NAME"
   fi
+}
+
+# ---------- ساخت سرور ----------
+cr() {
+  local NAME PORT KEY="" PRIV="" GENKEY=0
+  case "$#" in
+    0) NAME=$(rand_name); PORT=$(rand_port) || die "پورت آزاد پیدا نشد"; GENKEY=1 ;;
+    1) NAME=$1; PORT=$(rand_port) || die "پورت آزاد پیدا نشد"; GENKEY=1 ;;
+    3) NAME=$1; PORT=$2; KEY=$3 ;;
+    *) die "استفاده: $CMD cr   یا   $CMD cr NAME   یا   $CMD cr NAME PORT PUBKEY_FILE" ;;
+  esac
 
   valid_name "$NAME" || die "نام نامعتبر (فقط a-z 0-9 _ - ، شروع با حرف)"
   [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || die "پورت نامعتبر"
@@ -569,22 +685,7 @@ add() {
   valid_rate "$BW_UP"   || die "مقدار BW_UP نامعتبر است: $BW_UP (مثال: 512kbit، 10mbit، off)"
   valid_rate "$BW_DOWN" || die "مقدار BW_DOWN نامعتبر است: $BW_DOWN (مثال: 512kbit، 10mbit، off)"
 
-  # ---- بررسی کلید ----
-  [ -f "$KEY" ] || die "فایل کلید پیدا نشد: $KEY"
-  local n PUBKEY tmp
-  n=$(grep -cv '^[[:space:]]*$' "$KEY" || true)
-  [ "$n" -eq 1 ] || die "فایل کلید باید دقیقاً یک خط (یک کلید) داشته باشد"
-  PUBKEY=$(grep -v '^[[:space:]]*$' "$KEY" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-  local keyre='^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]'
-  [[ "$PUBKEY" =~ $keyre ]] || die "کلید عمومی معتبر نیست (باید با ssh-ed25519، ssh-rsa و... شروع شود)"
-  tmp=$(mktemp)
-  printf '%s\n' "$PUBKEY" > "$tmp"
-  if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"
-    die "کلید عمومی نامعتبر"
-  fi
-  rm -f "$tmp"
-
+  # اگر هنوز setup نشده، خودکار انجام بده
   if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1 \
      || ! docker image inspect "$IMG" >/dev/null 2>&1 \
      || ! docker network inspect "$NET" >/dev/null 2>&1; then
@@ -599,22 +700,53 @@ add() {
     die "پورت $PORT روی سرور در حال استفاده است"
   fi
 
+  # ---- کلید ----
+  if [ "$GENKEY" -eq 1 ]; then
+    install_deps
+    mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR"
+    PRIV="$KEYDIR/$NAME"
+    [ ! -e "$PRIV" ] || die "کلیدی با نام $PRIV از قبل وجود دارد"
+    ssh-keygen -q -t ed25519 -N "" -C "$NAME" -f "$PRIV"
+    KEY="$PRIV.pub"
+  fi
+
+  [ -f "$KEY" ] || die "فایل کلید پیدا نشد: $KEY"
+  local n PUBKEY tmp
+  n=$(grep -cv '^[[:space:]]*$' "$KEY" || true)
+  if [ "$n" -ne 1 ]; then
+    [ "$GENKEY" -eq 1 ] && rm -f "$PRIV" "$PRIV.pub"
+    die "فایل کلید باید دقیقاً یک خط (یک کلید) داشته باشد"
+  fi
+  PUBKEY=$(grep -v '^[[:space:]]*$' "$KEY" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  local keyre='^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]'
+  if ! [[ "$PUBKEY" =~ $keyre ]]; then
+    [ "$GENKEY" -eq 1 ] && rm -f "$PRIV" "$PRIV.pub"
+    die "کلید عمومی معتبر نیست (باید با ssh-ed25519، ssh-rsa و... شروع شود)"
+  fi
+  tmp=$(mktemp)
+  printf '%s\n' "$PUBKEY" > "$tmp"
+  if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    [ "$GENKEY" -eq 1 ] && rm -f "$PRIV" "$PRIV.pub"
+    die "کلید عمومی نامعتبر"
+  fi
+  rm -f "$tmp"
+
   local CPUS
   CPUS=$(awk -v c="$CPU_CORES" -v p="$CPU_PERCENT" 'BEGIN{printf "%.2f", c*p/100}')
-  awk -v x="$CPUS" 'BEGIN{exit !(x>=0.01)}' || die "سهم CPU خیلی کم است ($CPUS)"
+  if ! awk -v x="$CPUS" 'BEGIN{exit !(x>=0.01)}'; then
+    [ "$GENKEY" -eq 1 ] && rm -f "$PRIV" "$PRIV.pub"
+    die "سهم CPU خیلی کم است ($CPUS)"
+  fi
 
   # ---- انتخاب روش محدودیت دیسک ----
   local DISKMODE=volume
   if [ -n "$DISK" ]; then
-    if quota_supported; then
-      DISKMODE=quota
-    else
-      DISKMODE=loop
-    fi
+    if quota_supported; then DISKMODE=quota; else DISKMODE=loop; fi
   fi
   case "$DISKMODE" in
     quota)  echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=$DISK (quota داکر)" ;;
-    loop)   echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=$DISK (دیسک loop برای /root؛ quota داکر روی این سرور پشتیبانی نمی‌شود)" ;;
+    loop)   echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=$DISK (دیسک loop برای /root)" ;;
     volume) echo "[info] RAM=$RAM CPU=$CPUS هسته ($CPU_PERCENT% از $CPU_CORES) DISK=نامحدود" ;;
   esac
 
@@ -630,7 +762,10 @@ add() {
       args+=(--storage-opt "size=$DISK")
       ;;
     loop)
-      make_loop_disk "$NAME" || die "ساخت دیسک loop شکست خورد"
+      if ! make_loop_disk "$NAME"; then
+        [ "$GENKEY" -eq 1 ] && rm -f "$PRIV" "$PRIV.pub"
+        die "ساخت دیسک loop شکست خورد"
+      fi
       created_loop=1
       args+=(-v "$LOOPMNT/$NAME:/root")
       ;;
@@ -661,28 +796,27 @@ add() {
     die "ساخت کانتینر شکست خورد"
   fi
 
+  mkdir -p "$META"
+  printf 'M_DISK=%s\nM_MODE=%s\n' "${DISK:-}" "$DISKMODE" > "$META/$NAME"
+
   bw_conf_write "$NAME" "$BW_UP" "$BW_DOWN"
   sleep 1
   if ! bw_apply "$NAME"; then
-    warn "محدودیت پهنای باند اعمال نشد؛ بعداً دوباره امتحان کن: $0 bw $NAME $BW_UP $BW_DOWN"
+    warn "محدودیت پهنای باند اعمال نشد؛ بعداً دوباره امتحان کن: $CMD bw $NAME $BW_UP $BW_DOWN"
   fi
 
-  print_info "$NAME" "$PORT" "$PRIV"
+  info_one "$NAME" 25
 }
 
-del() {
-  [ "$#" -eq 1 ] || die "استفاده: $0 del NAME"
+# ---------- حذف سرور ----------
+de() {
+  [ "$#" -eq 1 ] || die "استفاده: $CMD de NAME"
   local NAME=$1
-  valid_name "$NAME" || die "نام نامعتبر"
-  command -v docker >/dev/null || die "داکر نصب نیست"
-
-  local lbl
-  lbl=$(docker container inspect -f "{{index .Config.Labels \"$LABEL\"}}" "$NAME" 2>/dev/null || true)
-  [ "$lbl" = "1" ] || die "کانتینر $NAME وجود ندارد یا توسط vps-box ساخته نشده"
+  check_owned "$NAME"
 
   docker rm -f "$NAME" >/dev/null
-  rm -f "$BWDIR/$NAME" "$KEYDIR/$NAME" "$KEYDIR/$NAME.pub"
-  echo "[ok] کانتینر $NAME حذف شد"
+  rm -f "$BWDIR/$NAME" "$META/$NAME" "$KEYDIR/$NAME" "$KEYDIR/$NAME.pub"
+  echo "[ok] سرور $NAME حذف شد"
 
   if docker volume inspect "${NAME}_root" >/dev/null 2>&1; then
     if [ "$PURGE" = "1" ]; then
@@ -703,12 +837,40 @@ del() {
   fi
 }
 
+usage() {
+  cat <<EOF
+استفاده:
+  $CMD cr                      ساخت سرور (نام و پورت رندوم + کلید خودکار + لینک sshx)
+  $CMD cr NAME                 ساخت سرور با نام دلخواه
+  $CMD cr NAME PORT PUB_FILE   ساخت با نام، پورت و کلید عمومی دلخواه
+  $CMD de NAME                 حذف سرور
+  $CMD info NAME               اطلاعات یک سرور (لینک sshx، پردازنده، اسم، پورت و ...)
+  $CMD all info                اطلاعات همه سرورها
+  $CMD bw NAME [UP DOWN]       نمایش/تغییر پهنای باند (off = نامحدود)
+مثال با تنظیمات:  RAM=512m DISK=5G $CMD cr
+EOF
+}
+
 case "${1:-}" in
-  setup)    setup ;;
-  add)      shift; add "$@" ;;
-  del)      shift; del "$@" ;;
-  firewall) firewall ;;
-  bw)       shift; bw_cmd "$@" ;;
-  watch)    bw_watch ;;
-  *) echo "استفاده: $0 {setup | add [NAME PORT PUBKEY] | del NAME | bw NAME [UP DOWN]}" >&2; exit 1 ;;
+  ""|setup|install)
+    setup
+    echo
+    echo "دستور $CMD نصب شد (سروری ساخته نشد). اگر در همین ترمینال پیدا نشد: hash -r"
+    echo
+    usage
+    ;;
+  cr|add|create)   shift; cr "$@" ;;
+  de|del|rm|delete) shift; de "$@" ;;
+  info)            shift; info_cmd "$@" ;;
+  all)             shift
+                   case "${1:-info}" in
+                     info) info_all ;;
+                     *)    die "استفاده: $CMD all info" ;;
+                   esac ;;
+  ls|list)         info_all ;;
+  bw)              shift; bw_cmd "$@" ;;
+  firewall)        firewall ;;
+  watch)           bw_watch ;;
+  help|-h|--help)  usage ;;
+  *)               usage >&2; exit 1 ;;
 esac

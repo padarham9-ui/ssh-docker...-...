@@ -3,7 +3,7 @@
 # docker-cssh (VM edition): every server is a FULL, separate virtual machine (KVM + QEMU).
 # Own kernel, own virtual disk, own virtual network card. Nothing is shared with the host
 # except the CPU (through hardware virtualization).
-# v4.6
+# v4.7
 # INSTALL (once; does NOT create a server, it only installs the docker-cssh command):
 #   sudo bash vm.sh
 #
@@ -23,6 +23,10 @@
 # ------------------------------------------------------------------
 set -euo pipefail
 umask 022
+# a fixed PATH: this script runs as root and must not pick up programs from a caller-controlled PATH
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ENV_SUBNET="${SUBNET:-}"           # remembered: was SUBNET given explicitly by the caller?
 
 # ================== DEFAULTS (shown as [default] in the questions) ==================
 RAM="${RAM:-512m}"                 # e.g. 512m, 1g (this is the REAL memory of the VM, a hard cap)
@@ -31,16 +35,21 @@ CPU_PERCENT="${CPU_PERCENT:-20}"   # percent of those cores the VM may really us
 DISK="${DISK:-10G}"                # virtual disk size (a hard cap; the file on the host grows only as used)
 DISK_IOPS="${DISK_IOPS:-3000}"     # disk operations per second cap (0 = unlimited)
 DISK_MBPS="${DISK_MBPS:-100}"      # disk throughput cap in MB/s (0 = unlimited)
-SUBNET="${SUBNET:-172.30.0.0/24}"  # private network of the VMs; must be a /24 (change if it conflicts)
+SUBNET="${SUBNET:-172.30.0.0/24}"  # private network of the VMs; must be a /24. Saved by setup; cannot change while servers exist
 BW_UP="${BW_UP:-45mbit}"           # upload cap (VM -> internet)   e.g. 512kbit, 10mbit, 1gbit ; off = unlimited
 BW_DOWN="${BW_DOWN:-50mbit}"       # download cap (internet -> VM) e.g. 512kbit, 10mbit, 1gbit ; off = unlimited
 WAIT_BOOT="${WAIT_BOOT:-360}"      # seconds to wait for a new VM to answer on SSH (a CPU cap makes the first boot slow)
+SSHX="${SSHX:-on}"                 # on = install the sshx web terminal in new servers; off = plain SSH only
+                                   # (sshx gives a root shell through the third-party relay sshx.io to anyone with the link)
 
-# ---- security policy (edit the lists, then run "sudo bash vm.sh" again to apply to the firewall) ----
+# ---- security policy (edit the lists, then run "sudo bash vm.sh" again: setup SAVES them and applies them to the firewall) ----
 # Outbound TCP ports that servers may NOT connect to (space separated; ranges like 6660:6669 work):
 #   25/465/587 = SMTP spam, 23 = telnet, 135/139/445 = SMB, 3389 = RDP,
 #   6660-6669 = IRC (botnets), 3333/4444/5555/7777/14444/45700 = common crypto-mining pool ports
 BLOCK_TCP_PORTS="${BLOCK_TCP_PORTS:-25 465 587 23 135 139 445 3389 6660:6669 3333 4444 5555 7777 14444 45700}"
+# Maximum simultaneous connections one server may have open (protects the host's connection-tracking
+# table, which all servers share). 0 = unlimited.
+CONN_LIMIT="${CONN_LIMIT:-4000}"
 # Packages that "apt install" refuses inside NEW servers. NOTE: root inside a VM can undo this;
 # it is only a speed bump. The real protection is the network firewall above.
 BLOCKED_PKGS="${BLOCKED_PKGS:-nmap zmap masscan hping3 hydra hydra-gtk medusa ncrack patator john john-data hashcat aircrack-ng reaver mdk4 kismet sqlmap nikto metasploit-framework wireshark tshark tcpdump ettercap-text-only ettercap-graphical dsniff bettercap netdiscover arp-scan nbtscan onesixtyone slowhttptest thc-ssl-dos tor torsocks obfs4proxy transmission-cli transmission-daemon transmission-common qbittorrent qbittorrent-nox deluge deluged deluge-console rtorrent ktorrent amule-daemon mldonkey-server xmrig cpuminer cgminer bfgminer ethminer}"
@@ -51,6 +60,11 @@ UBUNTU_RELEASE="${UBUNTU_RELEASE:-noble}"
 HOST_SYSCTLS="${HOST_SYSCTLS:-kernel.dmesg_restrict=1:max kernel.kptr_restrict=2:max kernel.unprivileged_bpf_disabled=1:max net.core.bpf_jit_harden=2:max kernel.yama.ptrace_scope=1:max kernel.perf_event_paranoid=3:max fs.suid_dumpable=0:min fs.protected_symlinks=1:max fs.protected_hardlinks=1:max kernel.randomize_va_space=2:max}"
 # ====================================================================================
 
+# what this run asked for (environment or the defaults above); setup saves these to host.conf
+WANT_SUBNET=$SUBNET
+WANT_BLOCK=$BLOCK_TCP_PORTS
+WANT_CONN=$CONN_LIMIT
+
 CMD=docker-cssh
 SELF=/usr/local/bin/docker-cssh
 ALIAS=/usr/local/bin/docker-cash   # same command, alternate spelling
@@ -60,7 +74,7 @@ STATE=/var/lib/vps-box
 BASEDIR=$STATE/base                # shared read-only Ubuntu images
 VMROOT=$STATE/vms                  # one private directory per VM (disk + seed)
 CONFDIR=/etc/vps-box
-CONF=$CONFDIR/host.conf            # detected QEMU settings
+CONF=$CONFDIR/host.conf            # detected QEMU settings + saved network / firewall policy
 META=$CONFDIR/meta.d               # one settings file per VM
 PUBDIR=$CONFDIR/pub.d              # the owner's public key per VM
 BWDIR=$CONFDIR/bw.d                # bandwidth per VM
@@ -76,7 +90,7 @@ QEMU_CPU="host,-vmx,-svm"
 KVM_GID=""
 CR_PENDING=""
 SANDBOX_OPTS="on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
-M_IDX=""; M_IP=""; M_PORT=""; M_MAC=""; M_RAM_MB=""; M_DISK=""; M_SMP=""; M_QUOTA=""; M_BASE=""; M_IOPS=""; M_MBPS=""
+M_IDX=""; M_IP=""; M_PORT=""; M_MAC=""; M_RAM_MB=""; M_DISK=""; M_SMP=""; M_QUOTA=""; M_BASE=""; M_IOPS=""; M_MBPS=""; M_DNS=""; M_SSHX=""
 cur_up=off; cur_down=off
 
 die()  { echo "[ERROR] $*" >&2; exit 1; }
@@ -130,18 +144,29 @@ check_arch() {
   [ "$(uname -m)" = "x86_64" ] || die "This version supports x86_64 only (this machine is $(uname -m))"
 }
 
+# How the unprivileged QEMU users reach /dev/kvm. Sets KVM_GID:
+#   ""  = /dev/kvm is world read/write, no extra group is needed
+#   GID = the (non-root) group that has read/write access
+# Returns 1 if neither works. The root group (GID 0) is never handed to QEMU.
+kvm_access() {
+  local gid mode
+  KVM_GID=""
+  [ -c /dev/kvm ] || return 1
+  gid=$(stat -c %g /dev/kvm)
+  mode=$(stat -c %a /dev/kvm)
+  mode=$(( 8#$mode ))
+  if [ $(( mode & 6 )) -eq 6 ]; then return 0; fi
+  if [ "$gid" != 0 ] && [ $(( mode & 48 )) -eq 48 ]; then KVM_GID=$gid; return 0; fi
+  return 1
+}
+
 check_kvm() {
   if [ ! -c /dev/kvm ]; then
     modprobe kvm 2>/dev/null || true
     modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
   fi
   [ -c /dev/kvm ] || die "/dev/kvm does not exist. Hardware virtualization is not available (on a VPS: ask the provider to enable nested virtualization)."
-  local mode
-  KVM_GID=$(stat -c %g /dev/kvm)
-  mode=$(stat -c %a /dev/kvm)
-  if [ "$KVM_GID" = 0 ] && [ $(( 8#$mode & 6 )) -ne 6 ]; then
-    die "/dev/kvm belongs to root only (mode $mode); create a 'kvm' group for it or make it group/world accessible"
-  fi
+  kvm_access || die "/dev/kvm is not usable by unprivileged users (owner group is root or has no read/write access); give it a 'kvm' group with mode 660"
 }
 
 find_qemu() {
@@ -156,13 +181,40 @@ have_iso_tool() {
   command -v genisoimage >/dev/null 2>&1 || command -v mkisofs >/dev/null 2>&1 || command -v xorriso >/dev/null 2>&1
 }
 
+# host.conf is PARSED (never executed): only known keys are read
 load_conf() {
+  local k v
   if [ -f "$CONF" ]; then
-    # shellcheck disable=SC1090
-    . "$CONF"
+    while IFS='=' read -r k v || [ -n "$k" ]; do
+      case "$k" in
+        QEMU_BIN)        QEMU_BIN=$v ;;
+        QEMU_CPU)        QEMU_CPU=$v ;;
+        QEMU_SANDBOX)    QEMU_SANDBOX=$v ;;
+        SUBNET)          SUBNET=$v ;;
+        BLOCK_TCP_PORTS) BLOCK_TCP_PORTS=$v ;;
+        CONN_LIMIT)      CONN_LIMIT=$v ;;
+      esac
+    done < "$CONF"
   fi
+  if [ -n "$QEMU_BIN" ] && [ ! -x "$QEMU_BIN" ]; then QEMU_BIN=""; fi
   if [ -z "$QEMU_BIN" ]; then QEMU_BIN=$(find_qemu || true); fi
-  if [ -z "$KVM_GID" ] && [ -c /dev/kvm ]; then KVM_GID=$(stat -c %g /dev/kvm); fi
+  kvm_access || true
+  return 0
+}
+
+save_conf() {
+  mkdir -p "$CONFDIR"
+  {
+    echo "# written by setup"
+    printf 'QEMU_BIN=%s\n' "$QEMU_BIN"
+    printf 'QEMU_CPU=%s\n' "$QEMU_CPU"
+    printf 'QEMU_SANDBOX=%s\n' "$QEMU_SANDBOX"
+    printf 'SUBNET=%s\n' "$SUBNET"
+    printf 'BLOCK_TCP_PORTS=%s\n' "$BLOCK_TCP_PORTS"
+    printf 'CONN_LIMIT=%s\n' "$CONN_LIMIT"
+  } > "$CONF.tmp"
+  chmod 644 "$CONF.tmp"
+  mv -f "$CONF.tmp" "$CONF"
 }
 
 # ---------- size helpers ----------
@@ -170,7 +222,7 @@ load_conf() {
 norm_size() {
   local s=${1,,} n u b
   s=${s// /}
-  [[ "$s" =~ ^([0-9]+)([kmgt])?(i?b)?$ ]] || return 1
+  [[ "$s" =~ ^([0-9]{1,9})([kmgt])?(i?b)?$ ]] || return 1
   n=${BASH_REMATCH[1]}
   u=${BASH_REMATCH[2]}
   b=${BASH_REMATCH[3]}
@@ -208,7 +260,7 @@ norm_rate() {
   case "$s" in
     0|off|none|unlimited|no) echo off; return 0 ;;
   esac
-  [[ "$s" =~ ^([0-9]+)(([kmg])(bit|bps)?)?$ ]] || return 1
+  [[ "$s" =~ ^([0-9]{1,7})(([kmg])(bit|bps)?)?$ ]] || return 1
   n=$((10#${BASH_REMATCH[1]}))
   u=${BASH_REMATCH[3]:-m}
   [ "$n" -ge 1 ] || return 1
@@ -217,12 +269,12 @@ norm_rate() {
 
 validate_limits() {
   local maxc
-  [[ "$RAM" =~ ^[1-9][0-9]*[kmgKMG]$ ]]               || die "Invalid RAM value: $RAM"
+  [[ "$RAM" =~ ^[1-9][0-9]*[kmgtKMGT]$ ]]             || die "Invalid RAM value: $RAM"
   [[ "$DISK" =~ ^[1-9][0-9]*[kKmMgGtT]$ ]]            || die "Invalid DISK value: $DISK"
   [[ "$CPU_CORES" =~ ^[0-9]+(\.[0-9]+)?$ ]]           || die "Invalid CPU_CORES value: $CPU_CORES"
   [[ "$CPU_PERCENT" =~ ^[0-9]+(\.[0-9]+)?$ ]]         || die "Invalid CPU_PERCENT value: $CPU_PERCENT"
-  [[ "$DISK_IOPS" =~ ^[0-9]+$ ]]                      || die "Invalid DISK_IOPS value: $DISK_IOPS"
-  [[ "$DISK_MBPS" =~ ^[0-9]+$ ]]                      || die "Invalid DISK_MBPS value: $DISK_MBPS"
+  [[ "$DISK_IOPS" =~ ^[0-9]{1,9}$ ]]                  || die "Invalid DISK_IOPS value: $DISK_IOPS"
+  [[ "$DISK_MBPS" =~ ^[0-9]{1,7}$ ]]                  || die "Invalid DISK_MBPS value: $DISK_MBPS"
   maxc=$(nproc 2>/dev/null || echo 1)
   awk -v c="$CPU_CORES" -v n="$maxc" 'BEGIN{exit !(c>0 && c<=n)}' \
     || die "CPU_CORES must be greater than 0 and at most $maxc (cores of this host)"
@@ -243,11 +295,18 @@ check_owned() {
 }
 
 # ---------- per-VM settings ----------
+# The settings file is PARSED (never executed): only known keys are read.
 load_meta() {  # NAME -> sets M_* globals
-  M_IDX=""; M_IP=""; M_PORT=""; M_MAC=""; M_RAM_MB=""; M_DISK=""; M_SMP=""; M_QUOTA=""; M_BASE=""; M_IOPS=""; M_MBPS=""
+  local k v
+  M_IDX=""; M_IP=""; M_PORT=""; M_MAC=""; M_RAM_MB=""; M_DISK=""; M_SMP=""; M_QUOTA=""; M_BASE=""; M_IOPS=""; M_MBPS=""; M_DNS=""; M_SSHX=""
   [ -f "$META/$1" ] || return 1
-  # shellcheck disable=SC1090
-  . "$META/$1"
+  while IFS='=' read -r k v || [ -n "$k" ]; do
+    case "$k" in
+      M_IDX|M_IP|M_PORT|M_MAC|M_RAM_MB|M_DISK|M_SMP|M_QUOTA|M_BASE|M_IOPS|M_MBPS|M_DNS|M_SSHX)
+        printf -v "$k" '%s' "$v" ;;
+    esac
+  done < "$META/$1"
+  return 0
 }
 
 save_meta() {  # NAME (uses M_* globals)
@@ -264,6 +323,8 @@ save_meta() {  # NAME (uses M_* globals)
     printf 'M_BASE=%s\n' "$M_BASE"
     printf 'M_IOPS=%s\n' "$M_IOPS"
     printf 'M_MBPS=%s\n' "$M_MBPS"
+    printf 'M_DNS=%s\n' "$M_DNS"
+    printf 'M_SSHX=%s\n' "$M_SSHX"
   } > "$META/$1"
   chmod 600 "$META/$1"
 }
@@ -278,10 +339,25 @@ list_names() {
 
 # ---------- network plan ----------
 check_subnet() {
-  [[ "$SUBNET" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24$ ]] || die "SUBNET must look like 172.30.0.0/24 (a /24 ending in .0)"
+  local o
+  [[ "$SUBNET" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.0/24$ ]] || die "SUBNET must look like 172.30.0.0/24 (a /24 ending in .0)"
+  for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"; do
+    [ "$((10#$o))" -le 255 ] || die "SUBNET is not a valid network: $SUBNET"
+  done
 }
 subnet_prefix() { local s=${SUBNET%/*}; echo "${s%.*}"; }
-gw_ip()         { echo "$(subnet_prefix).1"; }
+gw_of()         { echo "${1%.*}.1"; }      # gateway of a VM address (always .1 of its /24)
+
+# the /24 the existing servers live in ("" if there are no servers)
+vm_subnet() {
+  local f ip
+  for f in "$META"/*; do
+    [ -f "$f" ] || continue
+    ip=$(sed -n 's/^M_IP=//p' "$f")
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "${ip%.*}.0/24"; return 0; fi
+  done
+  return 0
+}
 
 alloc_idx() {
   local i used=" " f v
@@ -411,7 +487,7 @@ ask_name() {   # sets NAME_ANSWER ("" = random)
 }
 
 # ---------- bandwidth limit (tc on the VM's tap device) ----------
-valid_rate() { [[ "$1" =~ ^(off|0|[1-9][0-9]*(kbit|mbit|gbit))$ ]]; }
+valid_rate() { [[ "$1" =~ ^(off|0|[1-9][0-9]{0,6}(kbit|mbit|gbit))$ ]]; }
 is_off()     { [ "$1" = off ] || [ "$1" = 0 ]; }
 
 to_kbit() {
@@ -433,15 +509,18 @@ burst_for() {
   echo "$b"
 }
 
+# the bandwidth file is PARSED (never executed) and every value is validated
 bw_conf_read() {
+  local k v
   cur_up=off; cur_down=off
-  local UP="" DOWN=""
-  if [ -f "$BWDIR/$1" ]; then
-    # shellcheck disable=SC1090
-    . "$BWDIR/$1"
-  fi
-  [ -z "${UP:-}" ]   || cur_up=$UP
-  [ -z "${DOWN:-}" ] || cur_down=$DOWN
+  [ -f "$BWDIR/$1" ] || return 0
+  while IFS='=' read -r k v || [ -n "$k" ]; do
+    case "$k" in
+      UP)   if valid_rate "$v"; then cur_up=$v; fi ;;
+      DOWN) if valid_rate "$v"; then cur_down=$v; fi ;;
+    esac
+  done < "$BWDIR/$1"
+  return 0
 }
 
 bw_conf_write() {
@@ -451,8 +530,10 @@ bw_conf_write() {
 
 bw_apply() {
   local name=$1 tap b
+  valid_name "$name" || { warn "invalid server name"; return 1; }
   command -v tc >/dev/null || { warn "tc is not installed; bandwidth not limited"; return 1; }
   load_meta "$name" || { warn "unknown server $name"; return 1; }
+  [[ "$M_IDX" =~ ^[0-9]+$ ]] || { warn "damaged settings of $name"; return 1; }
   bw_conf_read "$name"
   tap="vbt$M_IDX"
   ip link show "$tap" >/dev/null 2>&1 || { warn "network device $tap of $name not found (is the server running?)"; return 1; }
@@ -546,7 +627,7 @@ dns_upstreams() {
   for f in /run/systemd/resolve/resolv.conf /etc/resolv.conf; do
     [ -r "$f" ] || continue
     awk '$1 == "nameserver" {print $2}' "$f"
-  done | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -vE '^127\.' | sort -u
+  done | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | grep -vE '^127\.' | sort -u
 }
 
 # DNS servers given to every VM (max 3): up to 2 host upstreams + public fallbacks.
@@ -559,6 +640,7 @@ dns_list() {
   done
   for ip in 1.1.1.1 8.8.8.8; do
     [ "$c" -lt 3 ] || break
+    case " $out" in *" $ip "*) continue ;; esac
     out+="$ip "
     c=$((c + 1))
   done
@@ -571,6 +653,7 @@ harden_host() {
   local item key rest want dir path val target lines="" changed=0 conf=/etc/sysctl.d/99-vps-box.conf
   for item in $HOST_SYSCTLS; do
     key=${item%%=*}; rest=${item#*=}; want=${rest%%:*}; dir=${rest##*:}
+    [[ "$key" =~ ^[a-z0-9_.]+$ ]] && [[ "$want" =~ ^-?[0-9]+$ ]] || { warn "ignoring invalid HOST_SYSCTLS entry: $item"; continue; }
     path="/proc/sys/${key//.//}"
     [ -r "$path" ] || continue
     val=$(cat "$path" 2>/dev/null || true)
@@ -606,6 +689,7 @@ host_sysctl_status() {
   local item key rest want dir path val ok=0 total=0
   for item in $HOST_SYSCTLS; do
     key=${item%%=*}; rest=${item#*=}; want=${rest%%:*}; dir=${rest##*:}
+    [[ "$want" =~ ^-?[0-9]+$ ]] || continue
     path="/proc/sys/${key//.//}"
     [ -r "$path" ] || continue
     val=$(cat "$path" 2>/dev/null || true)
@@ -629,9 +713,9 @@ net_sysctl() {
 # ---------- Ubuntu base image ----------
 base_current() {
   local f=""
-  [ -f "$BASEDIR/CURRENT" ] && f=$(cat "$BASEDIR/CURRENT")
-  [ -n "$f" ] && [ -f "$f" ] || return 1
-  echo "$f"
+  if [ -f "$BASEDIR/CURRENT" ]; then f=$(cat "$BASEDIR/CURRENT"); fi
+  if [ -n "$f" ] && [ -f "$f" ]; then echo "$f"; return 0; fi
+  return 1
 }
 
 # virtual size of an image in MB (rounded up)
@@ -651,21 +735,28 @@ base_min_disk_mb() {
 }
 
 download_base() {
-  local url file sums hash dest tmp
+  local url file sums hash dest tmp cur
   [[ "$UBUNTU_RELEASE" =~ ^[a-z]+$ ]] || die "Invalid UBUNTU_RELEASE: $UBUNTU_RELEASE (use a release codename like noble)"
   file="${UBUNTU_RELEASE}-server-cloudimg-amd64.img"
   url="https://cloud-images.ubuntu.com/${UBUNTU_RELEASE}/current"
   mkdir -p "$BASEDIR"
   rm -f "$BASEDIR"/.download.* 2>/dev/null || true       # leftovers of an interrupted download
   echo "[info] checking the newest Ubuntu ${UBUNTU_RELEASE} cloud image"
-  sums=$(curl -fsSL --max-time 60 "$url/SHA256SUMS") || die "Could not download $url/SHA256SUMS (is UBUNTU_RELEASE=$UBUNTU_RELEASE correct?)"
+  if ! sums=$(curl -fsSL --proto '=https' --max-time 60 "$url/SHA256SUMS"); then
+    # offline / mirror down: keep working with the image we already have
+    if cur=$(base_current); then
+      warn "could not check for a newer Ubuntu image; keeping the existing one: $cur"
+      return 0
+    fi
+    die "Could not download $url/SHA256SUMS (is UBUNTU_RELEASE=$UBUNTU_RELEASE correct?)"
+  fi
   hash=$(awk -v f="*$file" '$2 == f {print $1; exit}' <<<"$sums")
   [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || die "Could not find $file in SHA256SUMS"
   dest="$BASEDIR/ubuntu-${UBUNTU_RELEASE}-${hash:0:12}.img"
   if [ ! -f "$dest" ]; then
     tmp="$BASEDIR/.download.$$"
     echo "[install] downloading $file (about 600MB)"
-    if ! curl -fL --retry 3 -o "$tmp" "$url/$file"; then
+    if ! curl -fL --proto '=https' --retry 3 -o "$tmp" "$url/$file"; then
       rm -f "$tmp"
       die "Image download failed"
     fi
@@ -683,13 +774,16 @@ download_base() {
 
 # remove old base images that no VM uses any more
 gc_bases() {
-  local f cur used
+  local f cur used m
   cur=$(base_current 2>/dev/null || true)
   for f in "$BASEDIR"/ubuntu-*.img; do
     [ -f "$f" ] || continue
     [ "$f" != "$cur" ] || continue
     used=0
-    if grep -qsl "^M_BASE=$f\$" "$META"/* 2>/dev/null; then used=1; fi
+    for m in "$META"/*; do
+      [ -f "$m" ] || continue
+      if [ "$(sed -n 's/^M_BASE=//p' "$m")" = "$f" ]; then used=1; break; fi
+    done
     if [ "$used" -eq 0 ]; then rm -f "$f"; echo "[info] removed unused old base image $f"; fi
   done
 }
@@ -715,18 +809,12 @@ qemu_smoke() {
   fi
   if out=$(qmp_try "${base[@]}" -cpu "$QEMU_CPU" -sandbox "$SANDBOX_OPTS") && [[ "$out" == *QMP* ]]; then
     QEMU_SANDBOX=on
-    echo "[ok] QEMU test passed (KVM, seccomp sandbox on, nested virtualization hidden from guests)"
+    echo "[ok] QEMU test passed (KVM, seccomp sandbox on)"
   else
     QEMU_SANDBOX=off
     warn "QEMU seccomp sandbox does not work on this host; VMs will run without it (the other protections stay)"
   fi
-  mkdir -p "$CONFDIR"
-  {
-    echo "# written by setup"
-    printf 'QEMU_BIN=%s\n' "$QEMU_BIN"
-    printf 'QEMU_CPU=%s\n' "$QEMU_CPU"
-    printf 'QEMU_SANDBOX=%s\n' "$QEMU_SANDBOX"
-  } > "$CONF"
+  save_conf
 }
 
 # ---------- firewall ----------
@@ -747,11 +835,27 @@ fw_guard_on() {
 meta_valid() {  # NAME
   local name=$1
   load_meta "$name" || return 1
-  if [[ "$M_IDX" =~ ^[0-9]+$ ]] && [[ "$M_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$M_PORT" =~ ^[0-9]+$ ]]; then
+  if [[ "$M_IDX" =~ ^[0-9]{1,3}$ ]] && [ "$M_IDX" -ge 2 ] && [ "$M_IDX" -le 254 ] \
+     && [[ "$M_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+     && [[ "$M_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$M_PORT" -ge 1 ] && [ "$M_PORT" -le 65535 ]; then
     return 0
   fi
   warn "ignoring invalid settings file $META/$name (empty or from an older version)"
   return 1
+}
+
+# DNS servers the VMs may reach even inside private ranges: what the host uses right now, plus
+# what every server was given when it was created (saved, so the list is also right at boot,
+# when the firewall is restored before the network and its resolvers are up).
+fw_dns_allowed() {
+  local f
+  {
+    dns_upstreams || true
+    for f in "$META"/*; do
+      [ -f "$f" ] || continue
+      sed -n 's/^M_DNS=//p' "$f" | tr ',' '\n'
+    done
+  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | grep -vE '^(0|127)\.' | sort -u
 }
 
 # VMs are routed (one tap device each, no bridge). Rules: VMs cannot reach the host, each other,
@@ -760,11 +864,15 @@ meta_valid() {  # NAME
 firewall() {
   command -v iptables >/dev/null || die "iptables is not installed"
   check_subnet
+  # the loops below load every server's settings: keep them local so the caller's M_* values survive
+  local M_IDX M_IP M_PORT M_MAC M_RAM_MB M_DISK M_SMP M_QUOTA M_BASE M_IOPS M_MBPS M_DNS M_SSHX
   local SUB f name r p ups ip
   SUB="$(subnet_prefix).0/24"
 
   modprobe xt_conntrack 2>/dev/null || true
   modprobe xt_comment 2>/dev/null || true
+  modprobe xt_addrtype 2>/dev/null || true
+  modprobe xt_connlimit 2>/dev/null || true
   fw_guard_on
 
   # --- NAT: internet access for VMs and the SSH port forwards ---
@@ -775,7 +883,13 @@ firewall() {
     [ -f "$f" ] || continue
     name=${f##*/}
     meta_valid "$name" || continue
-    ipt -t nat -A VPSDNAT ! -i 'vbt+' -p tcp --dport "$M_PORT" -j DNAT --to-destination "$M_IP:22"
+    # only connections addressed to THIS host are forwarded; traffic that merely passes through
+    # the host (other VMs/containers going out to the same port number) is left alone
+    if ! ipt -t nat -A VPSDNAT ! -i 'vbt+' -p tcp --dport "$M_PORT" -m addrtype --dst-type LOCAL \
+           -j DNAT --to-destination "$M_IP:22" 2>/dev/null; then
+      warn "iptables 'addrtype' match is not available; the SSH forward of $name matches any destination address"
+      ipt -t nat -A VPSDNAT ! -i 'vbt+' -p tcp --dport "$M_PORT" -j DNAT --to-destination "$M_IP:22"
+    fi
   done
   ipt -t nat -C POSTROUTING -j VPSNAT 2>/dev/null || ipt -t nat -I POSTROUTING -j VPSNAT
   ipt -t nat -C PREROUTING -j VPSDNAT 2>/dev/null || ipt -t nat -I PREROUTING -j VPSDNAT
@@ -790,25 +904,27 @@ firewall() {
   done
   ipt -A VPSOUT -o 'vbt+' -j DROP                            # VM -> VM is never allowed
   ipt -A VPSOUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  # DNS: only the host's own resolvers may be reached inside the private ranges (public DNS is always fine).
-  ups=$(dns_upstreams || true)
-  if [ -n "$ups" ]; then
-    for ip in $ups; do
-      ipt -A VPSOUT -d "$ip" -p udp --dport 53 -j ACCEPT
-      ipt -A VPSOUT -d "$ip" -p tcp --dport 53 -j ACCEPT
-    done
-  else
-    warn "no DNS resolver detected on the host; allowing DNS to any address"
-    ipt -A VPSOUT -p udp --dport 53 -j ACCEPT
-    ipt -A VPSOUT -p tcp --dport 53 -j ACCEPT
+  ipt -A VPSOUT -m conntrack --ctstate INVALID -j DROP
+  # one server cannot fill the connection-tracking table that all servers (and the host) share
+  if [[ "$CONN_LIMIT" =~ ^[0-9]{1,7}$ ]] && [ "$CONN_LIMIT" -gt 0 ]; then
+    ipt -A VPSOUT -m conntrack --ctstate NEW -m connlimit --connlimit-above "$CONN_LIMIT" \
+        --connlimit-mask 32 --connlimit-saddr -j DROP 2>/dev/null \
+      || warn "iptables 'connlimit' match is not available; CONN_LIMIT is not enforced"
   fi
+  # DNS: inside the private ranges only the resolvers the servers were given may be reached.
+  # (public DNS needs no rule: it passes the final ACCEPT. There is no "allow DNS anywhere" fallback.)
+  ups=$(fw_dns_allowed || true)
+  for ip in $ups; do
+    ipt -A VPSOUT -d "$ip" -p udp --dport 53 -j ACCEPT
+    ipt -A VPSOUT -d "$ip" -p tcp --dport 53 -j ACCEPT
+  done
   for r in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
            172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4; do
     ipt -A VPSOUT -d "$r" -j DROP
   done
   for p in $BLOCK_TCP_PORTS; do
-    [[ "$p" =~ ^[0-9]+(:[0-9]+)?$ ]] || { warn "ignoring invalid port in BLOCK_TCP_PORTS: $p"; continue; }
-    ipt -A VPSOUT -p tcp --dport "$p" -j DROP
+    [[ "$p" =~ ^[0-9]{1,5}(:[0-9]{1,5})?$ ]] || { warn "ignoring invalid port in BLOCK_TCP_PORTS: $p"; continue; }
+    ipt -A VPSOUT -p tcp --dport "$p" -j DROP 2>/dev/null || warn "could not block port $p (out of range?)"
   done
   ipt -A VPSOUT -j ACCEPT
 
@@ -828,9 +944,11 @@ firewall() {
   while ipt -D FORWARD -o 'vbt+' -j VPSIN 2>/dev/null; do :; done
   ipt -I FORWARD -o 'vbt+' -j VPSIN
   ipt -I FORWARD -i 'vbt+' -j VPSOUT
-  # VMs cannot open new connections to the host itself
+  # VMs get nothing from the host itself except replies to connections the host opened
+  # (older versions dropped only NEW packets; that rule is removed here)
   while ipt -D INPUT -i 'vbt+' -m conntrack --ctstate NEW -j DROP 2>/dev/null; do :; done
-  ipt -I INPUT -i 'vbt+' -m conntrack --ctstate NEW -j DROP
+  while ipt -D INPUT -i 'vbt+' -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP 2>/dev/null; do :; done
+  ipt -I INPUT -i 'vbt+' -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
 
   # IPv6 is not given to VMs: drop anything they try over IPv6
   if command -v ip6tables >/dev/null 2>&1; then
@@ -849,7 +967,7 @@ firewall() {
 install_self() {
   if [ -f "$0" ]; then
     if [ "$(readlink -f "$0")" != "$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")" ]; then
-      install -m 755 "$0" "$SELF"
+      install -o root -g root -m 755 "$0" "$SELF"
     fi
     ln -sf "$SELF" "$ALIAS"
     # remove the commands of earlier versions
@@ -895,14 +1013,34 @@ EOF
 
 # prepare host / image / firewall (does not create a server)
 setup() {
+  local cur portre='^[0-9: ]*$'
   check_virt
   check_arch
   has_systemd || die "systemd is required (every VM is a systemd service)"
+  load_conf
+
+  # network: existing servers decide the subnet (their addresses are baked into their disks)
+  cur=$(vm_subnet)
+  if [ -n "$cur" ]; then
+    if [ -n "$ENV_SUBNET" ] && [ "$ENV_SUBNET" != "$cur" ]; then
+      die "SUBNET cannot be changed to $ENV_SUBNET while servers exist in $cur (delete them first)"
+    fi
+    SUBNET=$cur
+  else
+    SUBNET=$WANT_SUBNET
+  fi
   check_subnet
+  # firewall policy: what this run asked for (environment or the lists in this file) is saved
+  BLOCK_TCP_PORTS=$WANT_BLOCK
+  CONN_LIMIT=$WANT_CONN
+  [[ "$BLOCK_TCP_PORTS" =~ $portre ]] || die "BLOCK_TCP_PORTS may contain only numbers, ':' and spaces"
+  [[ "$CONN_LIMIT" =~ ^[0-9]{1,7}$ ]] || die "Invalid CONN_LIMIT value: $CONN_LIMIT"
+
   check_kvm
   install_deps
-  load_conf
+  load_conf_bin
   mkdir -p "$STATE" "$BASEDIR" "$VMROOT" "$CONFDIR" "$META" "$PUBDIR" "$BWDIR" "$KEYDIR"
+  chown root:root "$STATE" "$BASEDIR" "$VMROOT" "$CONFDIR" "$META" "$PUBDIR" "$BWDIR" "$KEYDIR"
   chmod 711 "$STATE" "$VMROOT"
   chmod 755 "$BASEDIR" "$CONFDIR"
   chmod 700 "$KEYDIR" "$PUBDIR" "$META" "$BWDIR"
@@ -910,12 +1048,17 @@ setup() {
   net_sysctl
   download_base
   qemu_smoke
-  load_conf
   gc_bases
   install_self
   firewall
   persist_firewall
   echo "[ok] setup complete"
+}
+
+# after packages were installed: find QEMU again (without re-reading the saved policy)
+load_conf_bin() {
+  if [ -z "$QEMU_BIN" ]; then QEMU_BIN=$(find_qemu || true); fi
+  kvm_access || true
 }
 
 setup_done() {
@@ -943,8 +1086,8 @@ rand_port() {
 # sets the global PUBIP (no subshell, so the result is cached for the whole run)
 get_pubip() {
   if [ -z "$PUBIP" ]; then
-    PUBIP=$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
-    [[ "$PUBIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || PUBIP="<VPS-IP>"
+    PUBIP=$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null | head -c 64 || true)
+    [[ "$PUBIP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || PUBIP="<VPS-IP>"
   fi
 }
 
@@ -963,19 +1106,20 @@ vm_ssh() {  # NAME command...
   local name=$1 ip
   shift
   ip=$(sed -n 's/^M_IP=//p' "$META/$name")
-  [ -n "$ip" ] && [ -f "$KEYDIR/$name.mgmt" ] || return 1
-  timeout 15 ssh -n -i "$KEYDIR/$name.mgmt" -o BatchMode=yes -o ConnectTimeout=5 \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && [ -f "$KEYDIR/$name.mgmt" ] || return 1
+  timeout 15 ssh -n -F /dev/null -i "$KEYDIR/$name.mgmt" -o BatchMode=yes -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR \
     -o IdentitiesOnly=yes -o IdentityAgent=none -o ForwardAgent=no -o ForwardX11=no \
     -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ProxyCommand=none \
     "root@$ip" "$@"
 }
 
+# the link comes from inside the VM (untrusted): only plain link characters are ever printed
 get_sshx_link() {  # NAME [TRIES]
   local name=$1 tries=${2:-10} i l=""
   for i in $(seq 1 "$tries"); do
     l=$(vm_ssh "$name" 'cat /run/sshx.log' 2>/dev/null | head -c 65536 \
-        | grep -Eo 'https://sshx\.io/s/[^[:space:][:cntrl:]]+' | head -n1 || true)
+        | LC_ALL=C grep -Eo 'https://sshx\.io/s/[A-Za-z0-9_#-]{1,128}' | head -n1 || true)
     if [ -n "$l" ]; then echo "$l"; return 0; fi
     sleep 2
   done
@@ -984,9 +1128,12 @@ get_sshx_link() {  # NAME [TRIES]
 
 # wait until the VM answers on SSH. 0 = ready, 1 = timeout, 2 = the service stopped
 wait_vm() {  # NAME [SECONDS]
-  local name=$1 secs=${2:-$WAIT_BOOT} ip i
+  local name=$1 secs=${2:-$WAIT_BOOT} ip end
+  [[ "$secs" =~ ^[0-9]{1,6}$ ]] || secs=360
   ip=$(sed -n 's/^M_IP=//p' "$META/$name")
-  for i in $(seq 1 "$secs"); do
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  end=$(( SECONDS + secs ))       # a real deadline (each probe can itself take 2 seconds)
+  while [ "$SECONDS" -lt "$end" ]; do
     if ! systemctl is-active --quiet "$(unit_of "$name")"; then return 2; fi
     if timeout 2 bash -c "exec 3<>/dev/tcp/$ip/22" 2>/dev/null; then return 0; fi
     sleep 1
@@ -1008,21 +1155,32 @@ mk_iso() {  # OUT DIR   (volume label "cidata" = cloud-init NoCloud seed)
 }
 
 # first-boot configuration of the VM (cloud-init): keys, hostname, network, ssh hardening, sshx
+# Everything written into the YAML is validated first (keys, package list, DNS addresses).
 make_seed() {  # NAME OUT_ISO    (uses M_* globals)
-  local name=$1 out=$2 tmp userkey mgmtkey ns s hn blocked=""
-  tmp=$(mktemp -d)
-  userkey=$(cat "$PUBDIR/$name")
-  mgmtkey=$(awk '{print $1" "$2}' "$KEYDIR/$name.mgmt.pub")
-  if [ -n "${BLOCKED_PKGS// /}" ]; then blocked="$BLOCKED_PKGS"; fi
+  local name=$1 out=$2 tmp userkey mgmtkey ns s hn blocked="" rc=0
+  local keyre='^[a-z0-9@.-]+ [A-Za-z0-9+/=]+$' pkre='^[a-z0-9.+ -]*$'
+  userkey=$(cat "$PUBDIR/$name" 2>/dev/null) || return 1
+  mgmtkey=$(awk '{print $1" "$2}' "$KEYDIR/$name.mgmt.pub" 2>/dev/null) || return 1
+  [[ "$userkey" =~ $keyre ]] && [[ "$mgmtkey" =~ $keyre ]] || { warn "refusing to write an invalid SSH key into the VM config"; return 1; }
+  if [ -n "${BLOCKED_PKGS// /}" ]; then
+    [[ "$BLOCKED_PKGS" =~ $pkre ]] || { warn "BLOCKED_PKGS may contain only package names separated by spaces"; return 1; }
+    blocked="$BLOCKED_PKGS"
+  fi
   # a hostname may not contain "_" and may not end with "-"
   hn=${name//_/-}
   while [[ "$hn" == *- ]]; do hn=${hn%-}; done
 
+  ns=""
+  for s in ${M_DNS//,/ }; do
+    [[ "$s" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || continue
+    ns+="$s, "
+  done
+  ns=${ns%, }
+  [ -n "$ns" ] || ns="1.1.1.1, 8.8.8.8"
+
+  tmp=$(mktemp -d) || return 1
   printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$name" "$(date +%s)" "$hn" > "$tmp/meta-data"
 
-  ns=""
-  for s in $(dns_list); do ns+="$s, "; done
-  ns=${ns%, }
   cat > "$tmp/network-config" <<EOF
 version: 2
 ethernets:
@@ -1034,7 +1192,7 @@ ethernets:
       - $M_IP/32
     routes:
       - to: 0.0.0.0/0
-        via: $(gw_ip)
+        via: $(gw_of "$M_IP")
         on-link: true
     nameservers:
       addresses: [$ns]
@@ -1068,6 +1226,9 @@ write_files:
       AllowAgentForwarding no
       ClientAliveInterval 60
       ClientAliveCountMax 3
+EOF
+  if [ "$M_SSHX" != off ]; then
+    cat >> "$tmp/user-data" <<'EOF'
   - path: /etc/systemd/system/sshx.service
     permissions: "0644"
     content: |
@@ -1079,7 +1240,7 @@ write_files:
       [Service]
       Environment=HOME=/root
       UMask=0077
-      ExecStart=/bin/sh -c 'if command -v sshx >/dev/null 2>&1; then exec sshx; fi; curl -sSf https://sshx.io/get | sh -s run'
+      ExecStart=/bin/sh -c 'if command -v sshx >/dev/null 2>&1; then exec sshx; fi; curl -sSf --proto =https https://sshx.io/get | sh -s run'
       StandardOutput=truncate:/run/sshx.log
       StandardError=inherit
       Restart=always
@@ -1088,6 +1249,7 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 EOF
+  fi
   if [ -n "$blocked" ]; then
     cat >> "$tmp/user-data" <<EOF
   - path: /etc/apt/preferences.d/99-vps-box-blocked
@@ -1101,16 +1263,19 @@ EOF
   fi
   cat >> "$tmp/user-data" <<'EOF'
 runcmd:
-  - [ sh, -c, "curl -sSf https://sshx.io/get | sh || true" ]
+  - [ sh, -c, "systemctl try-reload-or-restart ssh || true" ]
+EOF
+  if [ "$M_SSHX" != off ]; then
+    cat >> "$tmp/user-data" <<'EOF'
+  - [ sh, -c, "curl -sSf --proto =https https://sshx.io/get | sh || true" ]
   - [ systemctl, daemon-reload ]
   - [ systemctl, enable, --now, sshx.service ]
 EOF
-
-  if ! mk_iso "$out" "$tmp"; then
-    rm -rf "$tmp"
-    return 1
   fi
+
+  mk_iso "$out" "$tmp" || rc=1
   rm -rf "$tmp"
+  return "$rc"
 }
 
 # the full QEMU command line of a VM (uses M_* globals)
@@ -1125,15 +1290,27 @@ vm_qemu_cmd() {  # NAME
   s+=" -drive file=$vd/disk.qcow2,format=qcow2,if=virtio,discard=unmap$thr"
   s+=" -drive file=$vd/seed.iso,format=raw,if=virtio,readonly=on"
   s+=" -netdev tap,id=n0,ifname=$tap,script=no,downscript=no"
-  s+=" -device virtio-net-pci,netdev=n0,mac=$M_MAC,rombar=0"
+  # romfile= (empty): no network-boot ROM is loaded into the guest (less code exposed, faster boot)
+  s+=" -device virtio-net-pci,netdev=n0,mac=$M_MAC,rombar=0,romfile="
   s+=" -device virtio-rng-pci"
   echo "$s"
+}
+
+# the settings that end up in the unit file / QEMU command line must be exactly what we expect
+meta_strict() {
+  [[ "$M_IDX" =~ ^[0-9]{1,3}$ ]] && [[ "$M_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+    && [[ "$M_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] && [[ "$M_RAM_MB" =~ ^[0-9]{1,8}$ ]] \
+    && [[ "$M_DISK" =~ ^[0-9]{1,9}[KMGT]$ ]] && [[ "$M_SMP" =~ ^[0-9]{1,4}$ ]] \
+    && [[ "$M_QUOTA" =~ ^[0-9]{1,6}$ ]] && [[ "${M_IOPS:-0}" =~ ^[0-9]{1,9}$ ]] \
+    && [[ "${M_MBPS:-0}" =~ ^[0-9]{1,7}$ ]] && [[ "$M_BASE" == "$BASEDIR"/ubuntu-*.img ]] \
+    && [[ "$M_BASE" != *[[:space:],]* ]]
 }
 
 # systemd unit of a VM: runs QEMU as its own unprivileged user, inside cgroup limits and a sandbox
 write_unit() {  # NAME   (uses M_* globals)
   local name=$1 vd="$VMROOT/$1" memmax
-  [ -n "$KVM_GID" ] || return 1
+  kvm_access || return 1
+  [ -n "$QEMU_BIN" ] || return 1
   memmax=$(( M_RAM_MB + 320 ))
   cat > "/etc/systemd/system/$(unit_of "$name")" <<EOF
 [Unit]
@@ -1144,7 +1321,7 @@ Wants=vps-box-fw.service
 [Service]
 Type=simple
 User=vbu$M_IDX
-SupplementaryGroups=$KVM_GID
+${KVM_GID:+SupplementaryGroups=$KVM_GID}
 ExecStartPre=+$SELF _tapup $name
 ExecStart=$(vm_qemu_cmd "$name")
 ExecStartPost=+$SELF _bw $name
@@ -1174,10 +1351,13 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+ProtectProc=invisible
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+SystemCallArchitectures=native
 LockPersonality=yes
 DevicePolicy=closed
 DeviceAllow=/dev/kvm rw
@@ -1191,21 +1371,28 @@ DeviceAllow=/dev/random r
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 644 "/etc/systemd/system/$(unit_of "$name")"
   systemctl daemon-reload
 }
 
 # create the tap device (owned by the VM's own user) and its routing; run by systemd as root before QEMU starts
 tapup() {  # NAME
-  local name=$1 tap
-  load_meta "$name" || die "unknown server $name"
+  local name=${1:-} tap gw
+  valid_name "$name" || die "invalid server name"
+  meta_valid "$name" || die "unknown server $name"
   tap="vbt$M_IDX"
+  gw=$(gw_of "$M_IP")
   ip link del "$tap" 2>/dev/null || true
   ip tuntap add dev "$tap" mode tap user "vbu$M_IDX" || die "could not create $tap"
   ip link set "$tap" up
-  ip addr add "$(gw_ip)/32" dev "$tap"
-  ip route replace "$M_IP/32" dev "$tap" src "$(gw_ip)"
+  ip addr add "$gw/32" dev "$tap"
+  ip route replace "$M_IP/32" dev "$tap" src "$gw"
   sysctl -q -w "net.ipv4.conf.$tap.rp_filter=1" >/dev/null 2>&1 || true
   sysctl -q -w "net.ipv4.conf.$tap.proxy_arp=0" >/dev/null 2>&1 || true
+  # answer ARP only for the gateway address of this tap (do not reveal the host's other addresses)
+  sysctl -q -w "net.ipv4.conf.$tap.arp_ignore=1" >/dev/null 2>&1 || true
+  sysctl -q -w "net.ipv4.conf.$tap.accept_redirects=0" >/dev/null 2>&1 || true
+  sysctl -q -w "net.ipv4.conf.$tap.send_redirects=0" >/dev/null 2>&1 || true
   if [ -e "/proc/sys/net/ipv6/conf/$tap/disable_ipv6" ]; then
     sysctl -q -w "net.ipv6.conf.$tap.disable_ipv6=1" >/dev/null 2>&1 || true
     sysctl -q -w "net.ipv6.conf.$tap.accept_ra=0" >/dev/null 2>&1 || true
@@ -1213,26 +1400,30 @@ tapup() {  # NAME
 }
 
 tapdown() {  # NAME
-  local name=$1
+  local name=${1:-}
+  valid_name "$name" || return 0
   load_meta "$name" || return 0
+  [[ "$M_IDX" =~ ^[0-9]{1,3}$ ]] || return 0
   ip link del "vbt$M_IDX" 2>/dev/null || true
 }
 
 # create the files of a VM: user, disk, seed, unit (uses M_* globals; used by cr and re)
 provision_vm() {  # NAME
   local name=$1 vd="$VMROOT/$1" user grp
+  meta_strict || { warn "the settings of $name are damaged or incomplete"; return 1; }
+  [ -f "$M_BASE" ] || return 1
   user="vbu$M_IDX"
   if ! id "$user" >/dev/null 2>&1; then
     useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$user" || return 1
   fi
-  grp=$(id -gn "$user")
-  rm -rf "$vd"
-  mkdir -p "$vd" || return 1
+  grp=$(id -gn "$user") || return 1
+  rm -rf "${VMROOT:?}/$name"
+  mkdir -p -m 700 "$vd" || return 1          # private from the first moment
   qemu-img create -f qcow2 -F qcow2 -b "$M_BASE" "$vd/disk.qcow2" "$M_DISK" >/dev/null || return 1
   make_seed "$name" "$vd/seed.iso" || return 1
-  chown -R "$user:$grp" "$vd"
-  chmod 700 "$vd"
-  chmod 600 "$vd/disk.qcow2" "$vd/seed.iso"
+  chown -R "$user:$grp" "$vd" || return 1
+  chmod 700 "$vd" || return 1
+  chmod 600 "$vd/disk.qcow2" "$vd/seed.iso" || return 1
   write_unit "$name" || return 1
   return 0
 }
@@ -1240,6 +1431,7 @@ provision_vm() {  # NAME
 # remove everything of a VM (safe to call on half-created servers)
 destroy_vm() {  # NAME
   local name=$1 idx unit
+  valid_name "$name" || return 0
   unit=$(unit_of "$name")
   idx=$(sed -n 's/^M_IDX=//p' "$META/$name" 2>/dev/null || true)
   if has_systemd; then
@@ -1248,7 +1440,7 @@ destroy_vm() {  # NAME
   fi
   rm -f "/etc/systemd/system/$unit"
   if has_systemd; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
-  if [ -n "$idx" ]; then
+  if [[ "$idx" =~ ^[0-9]{1,3}$ ]]; then
     ip link del "vbt$idx" 2>/dev/null || true
     if id "vbu$idx" >/dev/null 2>&1; then userdel "vbu$idx" >/dev/null 2>&1 || true; fi
   fi
@@ -1259,19 +1451,21 @@ destroy_vm() {  # NAME
 # ---------- show info of one server ----------
 info_one() {  # NAME [SSHX_TRIES]
   local name=$1 tries=${2:-2}
-  local status link key cpumodel disk_used
+  local status link key cpumodel disk_used extra=""
   load_meta "$name" || return 0
   status=$(systemctl is-active "$(unit_of "$name")" 2>/dev/null || true)
   cpumodel=$(host_cpu_model)
   get_pubip
   bw_conf_read "$name"
   disk_used=$(du -sh "$VMROOT/$name/disk.qcow2" 2>/dev/null | awk '{print $1}' || true)
+  if [[ "${M_IOPS:-0}" =~ ^[0-9]+$ ]] && [ "${M_IOPS:-0}" -gt 0 ]; then extra+=", max ${M_IOPS} IOPS"; fi
+  if [[ "${M_MBPS:-0}" =~ ^[0-9]+$ ]] && [ "${M_MBPS:-0}" -gt 0 ]; then extra+=", max ${M_MBPS}MB/s"; fi
 
   key=""
-  [ -f "$KEYDIR/$name" ] && key="$KEYDIR/$name"
+  if [ -f "$KEYDIR/$name" ]; then key="$KEYDIR/$name"; fi
 
   link=""
-  if [ "$status" = "active" ]; then
+  if [ "$status" = "active" ] && [ "$M_SSHX" != off ]; then
     link=$(get_sshx_link "$name" "$tries" || true)
   fi
 
@@ -1284,7 +1478,7 @@ info_one() {  # NAME [SSHX_TRIES]
   echo "SSH port  : $M_PORT"
   echo "CPU       : $M_SMP virtual core(s), limited to ${M_QUOTA}% of one core | host CPU: $cpumodel"
   echo "RAM       : ${M_RAM_MB}MB"
-  echo "Disk      : ${M_DISK}B virtual, used on host: ${disk_used:-?}$( [ "${M_IOPS:-0}" -gt 0 ] && echo ", max ${M_IOPS} IOPS" )$( [ "${M_MBPS:-0}" -gt 0 ] && echo ", max ${M_MBPS}MB/s" )"
+  echo "Disk      : ${M_DISK}B virtual, used on host: ${disk_used:-?}$extra"
   echo "Bandwidth : upload=$cur_up download=$cur_down"
   echo "----------------------------------------------"
   echo "Connect with SSH (open port $M_PORT in the firewall / Security Group):"
@@ -1293,11 +1487,15 @@ info_one() {  # NAME [SSHX_TRIES]
   else
     echo "  ssh -p $M_PORT root@$PUBIP"
   fi
-  echo "sshx link (anyone with this link gets a root shell: keep it secret):"
-  if [ -n "$link" ]; then
-    echo "  $link"
+  if [ "$M_SSHX" = off ]; then
+    echo "sshx link : disabled for this server (SSH only)"
   else
-    echo "  (not ready; the first boot takes a minute. Try later: $CMD info $name)"
+    echo "sshx link (anyone with this link gets a root shell: keep it secret):"
+    if [ -n "$link" ]; then
+      echo "  $link"
+    else
+      echo "  (not ready; the first boot takes a minute. Try later: $CMD info $name)"
+    fi
   fi
   echo "Delete this server:"
   echo "  $CMD de $name"
@@ -1350,8 +1548,10 @@ sec_host() {
   sec_row "$ok" "nested virtualization hidden from guests"
   if ipt -S VPSOUT >/dev/null 2>&1; then ok=1; else ok=0; fi
   sec_row "$ok" "firewall chains VPSOUT/VPSIN (internal networks and metadata service blocked; blocked ports: $BLOCK_TCP_PORTS)"
-  if ipt -C INPUT -i 'vbt+' -m conntrack --ctstate NEW -j DROP 2>/dev/null; then ok=1; else ok=0; fi
-  sec_row "$ok" "servers cannot open new connections to this host"
+  if ipt -S VPSOUT 2>/dev/null | grep -q -- '--connlimit-above'; then ok=1; else ok=0; fi
+  sec_row "$ok" "connection limit per server (CONN_LIMIT=$CONN_LIMIT; protects the shared connection table)"
+  if ipt -C INPUT -i 'vbt+' -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP 2>/dev/null; then ok=1; else ok=0; fi
+  sec_row "$ok" "servers cannot send anything to this host except replies"
   if ipt -C FORWARD -i 'vbt+' -j VPSOUT 2>/dev/null; then ok=1; else ok=0; fi
   sec_row "$ok" "servers cannot talk to each other, cannot spoof addresses (routed taps, no shared network)"
   if ipt -C FORWARD -i 'vbt+' -m comment --comment "$GUARD_COMMENT" -j DROP 2>/dev/null; then
@@ -1372,6 +1572,9 @@ sec_one() {  # NAME
   user=$(unit_prop "$name" User)
   if [[ "$user" == vbu* ]]; then ok=1; else ok=0; fi
   sec_row "$ok" "QEMU runs as its own unprivileged user ($user), not as root"
+  v=$(unit_prop "$name" SupplementaryGroups)
+  if [ "$v" != 0 ] && [ "$v" != root ]; then ok=1; else ok=0; fi
+  sec_row "$ok" "QEMU is not a member of the root group"
   v=$(unit_prop "$name" MemoryMax)
   if [ -n "$v" ] && [ "$v" != infinity ]; then ok=1; else ok=0; fi
   sec_row "$ok" "host memory cap on the VM process (MemoryMax), no swap"
@@ -1384,8 +1587,10 @@ sec_one() {  # NAME
   v=$(unit_prop "$name" ProtectSystem)
   if [ "$v" = strict ]; then ok=1; else ok=0; fi
   sec_row "$ok" "host file system read-only for QEMU (only its own VM folder is writable)"
-  if [ "${M_IOPS:-0}" -gt 0 ] || [ "${M_MBPS:-0}" -gt 0 ]; then ok=1; else ok=0; fi
+  if [ "${M_IOPS:-0}" -gt 0 ] 2>/dev/null || [ "${M_MBPS:-0}" -gt 0 ] 2>/dev/null; then ok=1; else ok=0; fi
   sec_row "$ok" "disk speed limits (IOPS ${M_IOPS:-0}, MB/s ${M_MBPS:-0})"
+  if [ "$M_SSHX" = off ]; then ok=1; else ok=0; fi
+  sec_row "$ok" "no sshx web terminal (with sshx, a root shell is reachable through sshx.io by link)"
   if [ "$st" = active ]; then
     pid=$(unit_prop "$name" MainPID)
     cmdline=""
@@ -1407,10 +1612,10 @@ sec_one() {  # NAME
 sec_cmd() {
   local n count=0
   if [ "$#" -gt 1 ]; then die "Usage: $CMD sec [NAME]"; fi
+  if [ "$#" -eq 1 ]; then check_owned "$1"; fi
   sec_host
   echo
   if [ "$#" -eq 1 ]; then
-    check_owned "$1"
     sec_one "$1"
     return 0
   fi
@@ -1424,16 +1629,15 @@ sec_cmd() {
 }
 
 # ---------- create a server ----------
-# Ctrl-C / kill during "cr": remove the half-created server instead of leaving junk behind
-cr_abort() {
+# Any exit before "cr" has finished (error, Ctrl-C, kill) removes the half-created server
+# instead of leaving junk behind (keys, user, disk, unit, firewall rules).
+cr_cleanup() {
   local n=$CR_PENDING
-  trap - INT TERM
+  [ -n "$n" ] || return 0
   CR_PENDING=""
-  echo >&2
-  warn "interrupted; removing the unfinished server '$n'"
-  if [ -n "$n" ]; then destroy_vm "$n"; fi
+  warn "creation did not finish; removing the unfinished server '$n'"
+  destroy_vm "$n" || true
   firewall || true
-  exit 130
 }
 
 cr() {
@@ -1450,12 +1654,26 @@ cr() {
     *) die "Usage: $CMD cr [-y]   or   $CMD cr NAME   or   $CMD cr NAME PORT PUBKEY_FILE" ;;
   esac
 
+  # problems with the arguments are reported before any question is asked
+  if [ -n "$NAME" ]; then
+    valid_name "$NAME" || die "Invalid name (only a-z 0-9 _ - ; must start with a letter)"
+    if vm_exists "$NAME"; then die "A server named $NAME already exists"; fi
+  fi
+  if [ -n "$PORT" ]; then [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || die "Invalid port"; fi
+  if [ "$GENKEY" -eq 0 ]; then [ -f "$KEY" ] || die "Key file not found: $KEY"; fi
+  case "${SSHX,,}" in
+    on|yes|1)  SSHX=on ;;
+    off|no|0)  SSHX=off ;;
+    *) die "Invalid SSHX value: $SSHX (use on or off)" ;;
+  esac
+
   # run setup automatically if it has not been done yet
   if ! setup_done; then
     echo "[info] setup has not been done yet; running it now..."
     setup
   fi
   load_conf
+  check_subnet
 
   # normalize values coming from environment variables / defaults
   RAM=$(norm_size "$RAM") || die "Invalid RAM value: $RAM"
@@ -1507,44 +1725,42 @@ cr() {
   if command -v ss >/dev/null 2>&1 && [ -n "$(ss -H -ltn "sport = :$PORT" 2>/dev/null)" ]; then
     die "Port $PORT is already in use on this host"
   fi
-
-  # from here on an interrupt removes everything that was created for this name
-  CR_PENDING=$NAME
-  trap cr_abort INT TERM
-
-  # ---- keys ----
-  local n PUBKEY tmp
   mkdir -p "$KEYDIR" "$PUBDIR"; chmod 700 "$KEYDIR" "$PUBDIR"
   if [ "$GENKEY" -eq 1 ]; then
     PRIV="$KEYDIR/$NAME"
-    [ ! -e "$PRIV" ] || die "Key $PRIV already exists"
+    # checked BEFORE the cleanup trap is armed: a key that is already there is never deleted
+    if [ -e "$PRIV" ] || [ -e "$PRIV.pub" ]; then die "Key $PRIV already exists (remove it first)"; fi
+  fi
+
+  # from here on ANY exit removes everything that was created for this name
+  CR_PENDING=$NAME
+  trap cr_cleanup EXIT
+  trap 'exit 130' INT TERM
+
+  # ---- keys ----
+  local n PUBKEY tmp
+  if [ "$GENKEY" -eq 1 ]; then
     ssh-keygen -q -t ed25519 -N "" -C "$NAME" -f "$PRIV"
     KEY="$PRIV.pub"
   fi
   [ -f "$KEY" ] || die "Key file not found: $KEY"
   n=$(grep -cv '^[[:space:]]*$' "$KEY" || true)
-  if [ "$n" -ne 1 ]; then
-    if [ "$GENKEY" -eq 1 ]; then rm -f "$PRIV" "$PRIV.pub"; fi
-    die "The key file must contain exactly one line (one key)"
-  fi
+  [ "$n" -eq 1 ] || die "The key file must contain exactly one line (one key)"
   # keep only "type base64" (the comment is dropped: it could contain characters that break the VM config)
   PUBKEY=$(grep -v '^[[:space:]]*$' "$KEY" | tr -d '\r' | awk '{print $1" "$2}')
   local keyre='^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+$'
-  if ! [[ "$PUBKEY" =~ $keyre ]]; then
-    if [ "$GENKEY" -eq 1 ]; then rm -f "$PRIV" "$PRIV.pub"; fi
-    die "Not a valid public key (must start with ssh-ed25519, ssh-rsa, ... and have no options in front)"
-  fi
+  [[ "$PUBKEY" =~ $keyre ]] \
+    || die "Not a valid public key (must start with ssh-ed25519, ssh-rsa, ... and have no options in front)"
   tmp=$(mktemp)
   printf '%s\n' "$PUBKEY" > "$tmp"
   if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
     rm -f "$tmp"
-    if [ "$GENKEY" -eq 1 ]; then rm -f "$PRIV" "$PRIV.pub"; fi
     die "Invalid public key"
   fi
   rm -f "$tmp"
 
   # ---- settings ----
-  M_IDX=$(alloc_idx) || { [ "$GENKEY" -eq 1 ] && rm -f "$PRIV" "$PRIV.pub"; die "No free VM slot (maximum 241 servers)"; }
+  M_IDX=$(alloc_idx) || die "No free VM slot (maximum 241 servers)"
   M_IP="$(subnet_prefix).$M_IDX"
   M_PORT=$PORT
   M_MAC=$(printf '52:54:00:%02x:%02x:%02x' "$(( (M_IDX * 7) % 256 ))" "$(( M_IDX % 256 ))" "$(( 255 - M_IDX ))")
@@ -1552,12 +1768,11 @@ cr() {
   M_DISK=$DISK
   M_SMP=$(awk -v c="$CPU_CORES" 'BEGIN{n=int(c); if (n<c) n++; if (n<1) n=1; print n}')
   M_QUOTA=$(awk -v c="$CPU_CORES" -v p="$CPU_PERCENT" 'BEGIN{q=int(c*p+0.5); if (q<1) q=1; print q}')
-  if ! M_BASE=$(base_current); then
-    if [ "$GENKEY" -eq 1 ]; then rm -f "$PRIV" "$PRIV.pub"; fi
-    die "No base image; run: sudo bash $0 setup"
-  fi
+  M_BASE=$(base_current) || die "No base image; run: sudo $CMD setup"
   M_IOPS=$DISK_IOPS
   M_MBPS=$DISK_MBPS
+  M_DNS=$(dns_list); M_DNS=${M_DNS// /,}
+  M_SSHX=$SSHX
 
   echo "[info] RAM=$(show_size "$RAM") CPU=$M_SMP core(s) limited to ${M_QUOTA}% of one core, DISK=$(show_size "$DISK") (full VM)"
   local avail_mb
@@ -1574,17 +1789,11 @@ cr() {
   save_meta "$NAME"
   bw_conf_write "$NAME" "$BW_UP" "$BW_DOWN"
 
-  if ! provision_vm "$NAME"; then
-    destroy_vm "$NAME"
-    firewall || true
-    die "Server creation failed (disk / seed / unit)"
-  fi
+  provision_vm "$NAME" || die "Server creation failed (disk / seed / unit)"
 
   firewall
   if ! systemctl enable --now "$(unit_of "$NAME")" >/dev/null 2>&1; then
     journalctl -u "$(unit_of "$NAME")" -n 25 --no-pager >&2 || true
-    destroy_vm "$NAME"
-    firewall || true
     die "The VM could not start (see the log above)"
   fi
 
@@ -1598,8 +1807,9 @@ cr() {
     warn "The VM is running but SSH is not answering yet; check later with: $CMD info $NAME"
   fi
 
-  trap - INT TERM
+  # the server is complete: from here on nothing removes it
   CR_PENDING=""
+  trap - EXIT INT TERM
   info_one "$NAME" 25
 }
 
@@ -1610,7 +1820,7 @@ re() {
     -y|--yes) YES=1; shift ;;
   esac
   [ "$#" -eq 1 ] || die "Usage: $CMD re [-y] NAME"
-  local NAME=$1
+  local NAME=$1 PORT
   check_owned "$NAME"
   if ! setup_done; then
     echo "[info] setup is not complete; running it now..."
@@ -1618,8 +1828,10 @@ re() {
   fi
   load_conf
   load_meta "$NAME" || die "Could not read the settings of $NAME"
+  meta_valid "$NAME" || die "The settings of $NAME are damaged; remove it with: $CMD de $NAME"
   [ -f "$PUBDIR/$NAME" ] || die "Could not read the SSH public key of $NAME"
   [ -f "$KEYDIR/$NAME.mgmt" ] || die "Management key of $NAME is missing"
+  PORT=$M_PORT
 
   if [ "$YES" -eq 0 ]; then
     [ -t 0 ] || die "Refusing to wipe '$NAME' without a confirmation; run: $CMD re -y $NAME"
@@ -1631,8 +1843,11 @@ re() {
   fi
 
   echo "[info] Reinstalling $NAME (port $M_PORT, RAM ${M_RAM_MB}MB, disk ${M_DISK}B)"
+  M_BASE=$(base_current) || die "No base image; run setup again"     # checked BEFORE anything is wiped
+  M_DNS=$(dns_list); M_DNS=${M_DNS// /,}
+  [ -n "$M_SSHX" ] || M_SSHX=on
+  meta_strict || die "The settings of $NAME are damaged or from an older version; remove it with: $CMD de $NAME"
   systemctl stop "$(unit_of "$NAME")" >/dev/null 2>&1 || true
-  M_BASE=$(base_current) || die "No base image; run setup again"
   save_meta "$NAME"
   if ! provision_vm "$NAME"; then
     die "Could not rebuild the VM files; the server was wiped but not started. Remove it with: $CMD de $NAME"
@@ -1650,7 +1865,7 @@ re() {
   if [ "$rc" -ne 0 ]; then warn "The VM is not answering on SSH yet; check later with: $CMD info $NAME"; fi
 
   echo "[ok] $NAME reinstalled (all old data is gone; the SSH key and port are unchanged; the sshx link is new;"
-  echo "     the SSH host key of the VM changed: run  ssh-keygen -R '[host]:$M_PORT'  on your computer)"
+  echo "     the SSH host key of the VM changed: run  ssh-keygen -R '[host]:$PORT'  on your computer)"
   info_one "$NAME" 25
 }
 
@@ -1695,7 +1910,8 @@ Usage:
   $CMD sec [NAME]              security report (which protections are active on the host / on each server)
   $CMD bw NAME [UP DOWN]       show / change bandwidth (off = unlimited)
   $CMD firewall                rebuild the firewall rules
-Defaults can be changed with env vars, e.g.:  RAM=1g DISK=20G $CMD cr -y
+  $CMD setup                   prepare / update the host (also saves SUBNET, BLOCK_TCP_PORTS, CONN_LIMIT)
+Defaults can be changed with env vars, e.g.:  RAM=1g DISK=20G SSHX=off $CMD cr -y
 Every server is a full KVM virtual machine (Ubuntu $UBUNTU_RELEASE).
 EOF
 }

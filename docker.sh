@@ -6,7 +6,7 @@
 #
 # INSTALL (once; does NOT create a server, it only installs the docker-cssh command):
 #   sudo bash vm.sh
-# v4
+#
 # After install:
 #   docker-cssh cr                      create a server (asks RAM / disk / CPU / bandwidth / name)
 #   docker-cssh cr -y                   create a server with defaults, no questions
@@ -22,6 +22,7 @@
 #   docker-cssh bw NAME                 show current bandwidth
 # ------------------------------------------------------------------
 set -euo pipefail
+umask 022
 
 # ================== DEFAULTS (shown as [default] in the questions) ==================
 RAM="${RAM:-512m}"                 # e.g. 512m, 1g (this is the REAL memory of the VM, a hard cap)
@@ -33,6 +34,7 @@ DISK_MBPS="${DISK_MBPS:-100}"      # disk throughput cap in MB/s (0 = unlimited)
 SUBNET="${SUBNET:-172.30.0.0/24}"  # private network of the VMs; must be a /24 (change if it conflicts)
 BW_UP="${BW_UP:-45mbit}"           # upload cap (VM -> internet)   e.g. 512kbit, 10mbit, 1gbit ; off = unlimited
 BW_DOWN="${BW_DOWN:-50mbit}"       # download cap (internet -> VM) e.g. 512kbit, 10mbit, 1gbit ; off = unlimited
+WAIT_BOOT="${WAIT_BOOT:-360}"      # seconds to wait for a new VM to answer on SSH (a CPU cap makes the first boot slow)
 
 # ---- security policy (edit the lists, then run "sudo bash vm.sh" again to apply to the firewall) ----
 # Outbound TCP ports that servers may NOT connect to (space separated; ranges like 6660:6669 work):
@@ -64,12 +66,15 @@ PUBDIR=$CONFDIR/pub.d              # the owner's public key per VM
 BWDIR=$CONFDIR/bw.d                # bandwidth per VM
 KEYDIR=$CONFDIR/keys               # generated private keys (root only)
 LOCKFILE=/run/vps-box.lock
+GUARD_COMMENT=vps-box-guard
 ASK_REPLY=""
+NAME_ANSWER=""
 PUBIP=""
 QEMU_BIN=""
 QEMU_SANDBOX=on
 QEMU_CPU="host,-vmx,-svm"
 KVM_GID=""
+CR_PENDING=""
 SANDBOX_OPTS="on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
 M_IDX=""; M_IP=""; M_PORT=""; M_MAC=""; M_RAM_MB=""; M_DISK=""; M_SMP=""; M_QUOTA=""; M_BASE=""; M_IOPS=""; M_MBPS=""
 cur_up=off; cur_down=off
@@ -85,7 +90,8 @@ has_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>
 # not root -> re-run with sudo automatically
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null 2>&1 || die "You must be root (run with sudo)"
-  exec sudo -E bash "$(readlink -f "$0" 2>/dev/null || echo "$0")" "$@"
+  [ -f "$0" ] || die "Run this script from a file (not from a pipe), e.g.: sudo bash vm.sh"
+  exec sudo -E bash "$(readlink -f "$0")" "$@"
 fi
 
 # only one mutating command at a time
@@ -210,12 +216,18 @@ norm_rate() {
 }
 
 validate_limits() {
+  local maxc
   [[ "$RAM" =~ ^[1-9][0-9]*[kmgKMG]$ ]]               || die "Invalid RAM value: $RAM"
   [[ "$DISK" =~ ^[1-9][0-9]*[kKmMgGtT]$ ]]            || die "Invalid DISK value: $DISK"
   [[ "$CPU_CORES" =~ ^[0-9]+(\.[0-9]+)?$ ]]           || die "Invalid CPU_CORES value: $CPU_CORES"
   [[ "$CPU_PERCENT" =~ ^[0-9]+(\.[0-9]+)?$ ]]         || die "Invalid CPU_PERCENT value: $CPU_PERCENT"
   [[ "$DISK_IOPS" =~ ^[0-9]+$ ]]                      || die "Invalid DISK_IOPS value: $DISK_IOPS"
   [[ "$DISK_MBPS" =~ ^[0-9]+$ ]]                      || die "Invalid DISK_MBPS value: $DISK_MBPS"
+  maxc=$(nproc 2>/dev/null || echo 1)
+  awk -v c="$CPU_CORES" -v n="$maxc" 'BEGIN{exit !(c>0 && c<=n)}' \
+    || die "CPU_CORES must be greater than 0 and at most $maxc (cores of this host)"
+  awk -v p="$CPU_PERCENT" 'BEGIN{exit !(p>=1 && p<=100)}' \
+    || die "CPU_PERCENT must be between 1 and 100"
 }
 
 valid_name() { [[ "$1" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; }
@@ -484,7 +496,11 @@ bw_cmd() {
   UPV=$(norm_rate "$2")   || die "Invalid UP value (examples: 10mbit, 512kbit, off)"
   DOWNV=$(norm_rate "$3") || die "Invalid DOWN value (examples: 10mbit, 512kbit, off)"
   bw_conf_write "$NAME" "$UPV" "$DOWNV"
-  bw_apply "$NAME"
+  if systemctl is-active --quiet "$(unit_of "$NAME")" 2>/dev/null; then
+    bw_apply "$NAME" || die "The new limits are saved but could not be applied now (see the message above)"
+  else
+    echo "[ok] bandwidth of $NAME saved: upload=$UPV download=$DOWNV (applied when the server starts)"
+  fi
 }
 
 # ---------- host preparation ----------
@@ -495,6 +511,11 @@ install_deps() {
   command -v iptables   >/dev/null || pk+=(iptables)
   command -v flock      >/dev/null || pk+=(util-linux)
   command -v sha256sum  >/dev/null || pk+=(coreutils)
+  command -v timeout    >/dev/null || pk+=(coreutils)
+  command -v modprobe   >/dev/null || pk+=(kmod)
+  if ! command -v sysctl >/dev/null; then
+    if [ "$PM" = apt ]; then pk+=(procps); else pk+=(procps-ng); fi
+  fi
   if ! command -v tc >/dev/null || ! command -v ip >/dev/null || ! command -v ss >/dev/null; then
     if [ "$PM" = apt ]; then pk+=(iproute2); else pk+=(iproute iproute-tc); fi
   fi
@@ -545,28 +566,36 @@ dns_list() {
 }
 
 # Make the host kernel stricter. Only raises values; every key is skipped if the kernel lacks it.
+# The config file always lists ALL active strict values, so a re-run never drops earlier ones.
 harden_host() {
-  local item key rest want dir path val lines="" conf=/etc/sysctl.d/99-vps-box.conf
+  local item key rest want dir path val target lines="" changed=0 conf=/etc/sysctl.d/99-vps-box.conf
   for item in $HOST_SYSCTLS; do
     key=${item%%=*}; rest=${item#*=}; want=${rest%%:*}; dir=${rest##*:}
     path="/proc/sys/${key//.//}"
     [ -r "$path" ] || continue
     val=$(cat "$path" 2>/dev/null || true)
     [[ "$val" =~ ^-?[0-9]+$ ]] || continue
+    target=$val
     if [ "$dir" = max ]; then
-      [ "$val" -lt "$want" ] || continue
+      [ "$val" -ge "$want" ] || target=$want
     else
-      [ "$val" -gt "$want" ] || continue
+      [ "$val" -le "$want" ] || target=$want
     fi
-    if sysctl -q -w "$key=$want" >/dev/null 2>&1; then
-      lines+="$key = $want"$'\n'
-    else
-      warn "could not set $key=$want (kernel refused); skipped"
+    if [ "$target" != "$val" ]; then
+      if sysctl -q -w "$key=$target" >/dev/null 2>&1; then
+        changed=$((changed + 1))
+      else
+        warn "could not set $key=$target (kernel refused); skipped"
+        continue
+      fi
     fi
+    lines+="$key = $target"$'\n'
   done
   if [ -n "$lines" ]; then
     printf '# vps-box host hardening (applied at boot by systemd-sysctl)\n%s' "$lines" > "$conf"
-    echo "[ok] host kernel hardening applied: $(printf '%s' "$lines" | wc -l) setting(s) made stricter"
+  fi
+  if [ "$changed" -gt 0 ]; then
+    echo "[ok] host kernel hardening applied: $changed setting(s) made stricter"
   else
     echo "[ok] host kernel hardening: nothing to change (already at least as strict)"
   fi
@@ -613,7 +642,7 @@ image_vsize_mb() {
   echo $(( (b + 1048575) / 1048576 ))
 }
 
-# smallest disk a VM can have (the size of the image, +1GB of room)
+# smallest disk a VM can have (the size of the image, +512MB of room)
 base_min_disk_mb() {
   local f mb
   f=$(base_current) || { echo 4096; return 0; }
@@ -623,9 +652,11 @@ base_min_disk_mb() {
 
 download_base() {
   local url file sums hash dest tmp
+  [[ "$UBUNTU_RELEASE" =~ ^[a-z]+$ ]] || die "Invalid UBUNTU_RELEASE: $UBUNTU_RELEASE (use a release codename like noble)"
   file="${UBUNTU_RELEASE}-server-cloudimg-amd64.img"
   url="https://cloud-images.ubuntu.com/${UBUNTU_RELEASE}/current"
   mkdir -p "$BASEDIR"
+  rm -f "$BASEDIR"/.download.* 2>/dev/null || true       # leftovers of an interrupted download
   echo "[info] checking the newest Ubuntu ${UBUNTU_RELEASE} cloud image"
   sums=$(curl -fsSL --max-time 60 "$url/SHA256SUMS") || die "Could not download $url/SHA256SUMS (is UBUNTU_RELEASE=$UBUNTU_RELEASE correct?)"
   hash=$(awk -v f="*$file" '$2 == f {print $1; exit}' <<<"$sums")
@@ -640,7 +671,7 @@ download_base() {
     fi
     if ! echo "$hash  $tmp" | sha256sum -c --status; then
       rm -f "$tmp"
-      die "Image checksum mismatch; refusing to use it"
+      die "Image checksum mismatch (the image may have been updated during the download; run again)"
     fi
     qemu-img info "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "Downloaded image is not valid"; }
     chmod 644 "$tmp"
@@ -699,6 +730,19 @@ qemu_smoke() {
 }
 
 # ---------- firewall ----------
+# While the chains are rebuilt, all VM traffic is dropped for a split second (fail closed), so a
+# half-built rule set can never let anything through. If the rebuild dies, the guard stays (safe);
+# the next successful run removes it.
+fw_guard_off() {
+  while ipt -D FORWARD -i 'vbt+' -m comment --comment "$GUARD_COMMENT" -j DROP 2>/dev/null; do :; done
+  while ipt -D FORWARD -o 'vbt+' -m comment --comment "$GUARD_COMMENT" -j DROP 2>/dev/null; do :; done
+}
+fw_guard_on() {
+  fw_guard_off
+  ipt -I FORWARD -o 'vbt+' -m comment --comment "$GUARD_COMMENT" -j DROP
+  ipt -I FORWARD -i 'vbt+' -m comment --comment "$GUARD_COMMENT" -j DROP
+}
+
 # VMs are routed (one tap device each, no bridge). Rules: VMs cannot reach the host, each other,
 # private networks or the cloud metadata service; they cannot spoof addresses; abuse ports are blocked.
 # The rules are rebuilt from the saved VM settings every time (idempotent).
@@ -709,6 +753,8 @@ firewall() {
   SUB="$(subnet_prefix).0/24"
 
   modprobe xt_conntrack 2>/dev/null || true
+  modprobe xt_comment 2>/dev/null || true
+  fw_guard_on
 
   # --- NAT: internet access for VMs and the SSH port forwards ---
   ipt -t nat -N VPSNAT 2>/dev/null || ipt -t nat -F VPSNAT
@@ -784,6 +830,8 @@ firewall() {
     ip6t -I FORWARD -i 'vbt+' -j DROP 2>/dev/null || true
     ip6t -I FORWARD -o 'vbt+' -j DROP 2>/dev/null || true
   fi
+
+  fw_guard_off
 }
 
 # install this script as the docker-cssh command (and docker-cash as an alias)
@@ -802,6 +850,8 @@ install_self() {
 }
 
 # firewall rules are re-applied after reboot
+# (the service calls the internal "_fw" command, which does NOT take the lock: setup holds the
+#  lock while it restarts this service, so taking it again here would deadlock for 5 minutes)
 persist_firewall() {
   if [ ! -x "$SELF" ]; then
     warn "Firewall will not be restored after reboot (script not installed)"
@@ -814,12 +864,14 @@ persist_firewall() {
 [Unit]
 Description=vps-box firewall rules
 After=network-pre.target
+Wants=network-pre.target
 Before=network.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$SELF firewall
+TimeoutStartSec=120
+ExecStart=$SELF _fw
 
 [Install]
 WantedBy=multi-user.target
@@ -877,11 +929,12 @@ rand_port() {
   return 1
 }
 
+# sets the global PUBIP (no subshell, so the result is cached for the whole run)
 get_pubip() {
   if [ -z "$PUBIP" ]; then
-    PUBIP=$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || echo "<VPS-IP>")
+    PUBIP=$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
+    [[ "$PUBIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || PUBIP="<VPS-IP>"
   fi
-  echo "$PUBIP"
 }
 
 host_cpu_model() {
@@ -894,12 +947,13 @@ host_cpu_model() {
 }
 
 # run a command inside the VM with the management key (the output is untrusted data: callers limit it)
+# "-n" is essential: without it ssh swallows the stdin of the calling "while read" loop
 vm_ssh() {  # NAME command...
   local name=$1 ip
   shift
   ip=$(sed -n 's/^M_IP=//p' "$META/$name")
   [ -n "$ip" ] && [ -f "$KEYDIR/$name.mgmt" ] || return 1
-  timeout 15 ssh -i "$KEYDIR/$name.mgmt" -o BatchMode=yes -o ConnectTimeout=5 \
+  timeout 15 ssh -n -i "$KEYDIR/$name.mgmt" -o BatchMode=yes -o ConnectTimeout=5 \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     -o IdentitiesOnly=yes -o IdentityAgent=none -o ForwardAgent=no -o ForwardX11=no \
     -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ProxyCommand=none \
@@ -919,7 +973,7 @@ get_sshx_link() {  # NAME [TRIES]
 
 # wait until the VM answers on SSH. 0 = ready, 1 = timeout, 2 = the service stopped
 wait_vm() {  # NAME [SECONDS]
-  local name=$1 secs=${2:-240} ip i
+  local name=$1 secs=${2:-$WAIT_BOOT} ip i
   ip=$(sed -n 's/^M_IP=//p' "$META/$name")
   for i in $(seq 1 "$secs"); do
     if ! systemctl is-active --quiet "$(unit_of "$name")"; then return 2; fi
@@ -944,13 +998,16 @@ mk_iso() {  # OUT DIR   (volume label "cidata" = cloud-init NoCloud seed)
 
 # first-boot configuration of the VM (cloud-init): keys, hostname, network, ssh hardening, sshx
 make_seed() {  # NAME OUT_ISO    (uses M_* globals)
-  local name=$1 out=$2 tmp userkey mgmtkey ns s blocked=""
+  local name=$1 out=$2 tmp userkey mgmtkey ns s hn blocked=""
   tmp=$(mktemp -d)
   userkey=$(cat "$PUBDIR/$name")
   mgmtkey=$(awk '{print $1" "$2}' "$KEYDIR/$name.mgmt.pub")
   if [ -n "${BLOCKED_PKGS// /}" ]; then blocked="$BLOCKED_PKGS"; fi
+  # a hostname may not contain "_" and may not end with "-"
+  hn=${name//_/-}
+  while [[ "$hn" == *- ]]; do hn=${hn%-}; done
 
-  printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$name" "$(date +%s)" "$name" > "$tmp/meta-data"
+  printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$name" "$(date +%s)" "$hn" > "$tmp/meta-data"
 
   ns=""
   for s in $(dns_list); do ns+="$s, "; done
@@ -974,7 +1031,7 @@ EOF
 
   cat > "$tmp/user-data" <<EOF
 #cloud-config
-hostname: $name
+hostname: $hn
 manage_etc_hosts: localhost
 ssh_pwauth: false
 disable_root: false
@@ -1010,6 +1067,7 @@ write_files:
 
       [Service]
       Environment=HOME=/root
+      UMask=0077
       ExecStart=/bin/sh -c 'if command -v sshx >/dev/null 2>&1; then exec sshx; fi; curl -sSf https://sshx.io/get | sh -s run'
       StandardOutput=truncate:/run/sshx.log
       StandardError=inherit
@@ -1026,7 +1084,7 @@ EOF
     content: |
       # Packages listed here cannot be installed with apt.
       Package: $blocked
-      Pin: release *
+      Pin: release a=*
       Pin-Priority: -1
 EOF
   fi
@@ -1190,11 +1248,11 @@ destroy_vm() {  # NAME
 # ---------- show info of one server ----------
 info_one() {  # NAME [SSHX_TRIES]
   local name=$1 tries=${2:-2}
-  local status link key pubip cpumodel disk_used
+  local status link key cpumodel disk_used
   load_meta "$name" || return 0
   status=$(systemctl is-active "$(unit_of "$name")" 2>/dev/null || true)
   cpumodel=$(host_cpu_model)
-  pubip=$(get_pubip)
+  get_pubip
   bw_conf_read "$name"
   disk_used=$(du -sh "$VMROOT/$name/disk.qcow2" 2>/dev/null | awk '{print $1}' || true)
 
@@ -1220,11 +1278,11 @@ info_one() {  # NAME [SSHX_TRIES]
   echo "----------------------------------------------"
   echo "Connect with SSH (open port $M_PORT in the firewall / Security Group):"
   if [ -n "$key" ]; then
-    echo "  ssh -i $key -p $M_PORT root@$pubip"
+    echo "  ssh -i $key -p $M_PORT root@$PUBIP"
   else
-    echo "  ssh -p $M_PORT root@$pubip"
+    echo "  ssh -p $M_PORT root@$PUBIP"
   fi
-  echo "sshx link:"
+  echo "sshx link (anyone with this link gets a root shell: keep it secret):"
   if [ -n "$link" ]; then
     echo "  $link"
   else
@@ -1285,6 +1343,9 @@ sec_host() {
   sec_row "$ok" "servers cannot open new connections to this host"
   if ipt -C FORWARD -i 'vbt+' -j VPSOUT 2>/dev/null; then ok=1; else ok=0; fi
   sec_row "$ok" "servers cannot talk to each other, cannot spoof addresses (routed taps, no shared network)"
+  if ipt -C FORWARD -i 'vbt+' -m comment --comment "$GUARD_COMMENT" -j DROP 2>/dev/null; then
+    sec_row 0 "a firewall rebuild did not finish: all VM traffic is blocked. Run: $CMD firewall"
+  fi
   if systemctl is-active --quiet vps-box-fw.service 2>/dev/null; then ok=1; else ok=0; fi
   sec_row "$ok" "service vps-box-fw is active (rules come back after reboot)"
   st=$(host_sysctl_status)
@@ -1352,6 +1413,18 @@ sec_cmd() {
 }
 
 # ---------- create a server ----------
+# Ctrl-C / kill during "cr": remove the half-created server instead of leaving junk behind
+cr_abort() {
+  local n=$CR_PENDING
+  trap - INT TERM
+  CR_PENDING=""
+  echo >&2
+  warn "interrupted; removing the unfinished server '$n'"
+  if [ -n "$n" ]; then destroy_vm "$n"; fi
+  firewall || true
+  exit 130
+}
+
 cr() {
   local NAME="" PORT="" KEY="" PRIV="" GENKEY=0 INTERACTIVE=0
   if [ -t 0 ] && [ -t 1 ]; then INTERACTIVE=1; fi
@@ -1407,18 +1480,26 @@ cr() {
   valid_rate "$BW_UP"   || die "Invalid BW_UP value: $BW_UP (examples: 512kbit, 10mbit, off)"
   valid_rate "$BW_DOWN" || die "Invalid BW_DOWN value: $BW_DOWN (examples: 512kbit, 10mbit, off)"
 
-  local ram_mb disk_mb min_disk
+  local ram_mb disk_mb min_disk host_mb
   ram_mb=$(size_mb "$RAM")
   disk_mb=$(size_mb "$DISK")
   min_disk=$(base_min_disk_mb)
   [ "$ram_mb" -ge 128 ] || die "RAM must be at least 128MB"
   [ "$disk_mb" -ge "$min_disk" ] || die "DISK is too small: the Ubuntu image needs at least ${min_disk}MB"
+  host_mb=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || true)
+  if [[ "${host_mb:-}" =~ ^[0-9]+$ ]] && [ "$ram_mb" -gt "$host_mb" ]; then
+    die "RAM (${ram_mb}MB) is more than the memory of this host (${host_mb}MB)"
+  fi
 
   if vm_exists "$NAME"; then die "A server named $NAME already exists"; fi
   if port_used_by_vm "$PORT"; then die "Port $PORT is already used by another server"; fi
   if command -v ss >/dev/null 2>&1 && [ -n "$(ss -H -ltn "sport = :$PORT" 2>/dev/null)" ]; then
     die "Port $PORT is already in use on this host"
   fi
+
+  # from here on an interrupt removes everything that was created for this name
+  CR_PENDING=$NAME
+  trap cr_abort INT TERM
 
   # ---- keys ----
   local n PUBKEY tmp
@@ -1437,7 +1518,7 @@ cr() {
   fi
   # keep only "type base64" (the comment is dropped: it could contain characters that break the VM config)
   PUBKEY=$(grep -v '^[[:space:]]*$' "$KEY" | tr -d '\r' | awk '{print $1" "$2}')
-  local keyre='^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+$'
+  local keyre='^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+$'
   if ! [[ "$PUBKEY" =~ $keyre ]]; then
     if [ "$GENKEY" -eq 1 ]; then rm -f "$PRIV" "$PRIV.pub"; fi
     die "Not a valid public key (must start with ssh-ed25519, ssh-rsa, ... and have no options in front)"
@@ -1460,7 +1541,10 @@ cr() {
   M_DISK=$DISK
   M_SMP=$(awk -v c="$CPU_CORES" 'BEGIN{n=int(c); if (n<c) n++; if (n<1) n=1; print n}')
   M_QUOTA=$(awk -v c="$CPU_CORES" -v p="$CPU_PERCENT" 'BEGIN{q=int(c*p+0.5); if (q<1) q=1; print q}')
-  M_BASE=$(base_current) || die "No base image; run: sudo bash $0 setup"
+  if ! M_BASE=$(base_current); then
+    if [ "$GENKEY" -eq 1 ]; then rm -f "$PRIV" "$PRIV.pub"; fi
+    die "No base image; run: sudo bash $0 setup"
+  fi
   M_IOPS=$DISK_IOPS
   M_MBPS=$DISK_MBPS
 
@@ -1471,7 +1555,8 @@ cr() {
     warn "the virtual disk (${disk_mb}MB) is bigger than the free space on the host (${avail_mb}MB); fine while it stays mostly empty"
   fi
 
-  # management key (lets the host read the sshx link; root only)
+  # management key (lets the host read the sshx link; root only). A stale file would make ssh-keygen ask a question.
+  rm -f "$KEYDIR/$NAME.mgmt" "$KEYDIR/$NAME.mgmt.pub"
   ssh-keygen -q -t ed25519 -N "" -C "vps-box-mgmt" -f "$KEYDIR/$NAME.mgmt"
   printf '%s\n' "$PUBKEY" > "$PUBDIR/$NAME"
   chmod 600 "$PUBDIR/$NAME"
@@ -1492,9 +1577,9 @@ cr() {
     die "The VM could not start (see the log above)"
   fi
 
-  echo "[info] waiting for the VM to boot (first boot takes 30-90 seconds)..."
+  echo "[info] waiting for the VM to boot (first boot takes 30-90 seconds; longer with a low CPU limit)..."
   local rc=0
-  wait_vm "$NAME" 240 || rc=$?
+  wait_vm "$NAME" "$WAIT_BOOT" || rc=$?
   if [ "$rc" -eq 2 ]; then
     journalctl -u "$(unit_of "$NAME")" -n 25 --no-pager >&2 || true
     warn "The VM stopped right after starting. Remove it with: $CMD de $NAME"
@@ -1502,6 +1587,8 @@ cr() {
     warn "The VM is running but SSH is not answering yet; check later with: $CMD info $NAME"
   fi
 
+  trap - INT TERM
+  CR_PENDING=""
   info_one "$NAME" 25
 }
 
@@ -1523,7 +1610,8 @@ re() {
   [ -f "$PUBDIR/$NAME" ] || die "Could not read the SSH public key of $NAME"
   [ -f "$KEYDIR/$NAME.mgmt" ] || die "Management key of $NAME is missing"
 
-  if [ "$YES" -eq 0 ] && [ -t 0 ]; then
+  if [ "$YES" -eq 0 ]; then
+    [ -t 0 ] || die "Refusing to wipe '$NAME' without a confirmation; run: $CMD re -y $NAME"
     ask "This will ERASE ALL DATA of '$NAME' (disk, installed packages, running programs) and start it fresh. Continue? (Y/N)" "N"
     case "${ASK_REPLY,,}" in
       y|yes) ;;
@@ -1547,10 +1635,11 @@ re() {
 
   local rc=0
   echo "[info] waiting for the VM to boot..."
-  wait_vm "$NAME" 240 || rc=$?
+  wait_vm "$NAME" "$WAIT_BOOT" || rc=$?
   if [ "$rc" -ne 0 ]; then warn "The VM is not answering on SSH yet; check later with: $CMD info $NAME"; fi
 
-  echo "[ok] $NAME reinstalled (all old data is gone; the SSH key and port are unchanged; the sshx link is new)"
+  echo "[ok] $NAME reinstalled (all old data is gone; the SSH key and port are unchanged; the sshx link is new;"
+  echo "     the SSH host key of the VM changed: run  ssh-keygen -R '[host]:$M_PORT'  on your computer)"
   info_one "$NAME" 25
 }
 
@@ -1594,6 +1683,7 @@ Usage:
   $CMD all info                info of all servers
   $CMD sec [NAME]              security report (which protections are active on the host / on each server)
   $CMD bw NAME [UP DOWN]       show / change bandwidth (off = unlimited)
+  $CMD firewall                rebuild the firewall rules
 Defaults can be changed with env vars, e.g.:  RAM=1g DISK=20G $CMD cr -y
 Every server is a full KVM virtual machine (Ubuntu $UBUNTU_RELEASE).
 EOF
@@ -1625,6 +1715,7 @@ case "${1:-}" in
   bw)                 shift; take_lock; bw_cmd "$@" ;;
   sec|security)       shift; sec_cmd "$@" ;;
   firewall)           take_lock; firewall ;;
+  _fw)                firewall ;;          # used by vps-box-fw.service (no lock on purpose)
   _tapup)             shift; tapup "$@" ;;
   _tapdown)           shift; tapdown "$@" ;;
   _bw)                shift; bw_apply "$@" || true ;;

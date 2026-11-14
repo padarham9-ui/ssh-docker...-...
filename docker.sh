@@ -3,10 +3,10 @@
 # docker-cssh (VM edition): every server is a FULL, separate virtual machine (KVM + QEMU).
 # Own kernel, own virtual disk, own virtual network card. Nothing is shared with the host
 # except the CPU (through hardware virtualization).
-#
+# v4.6
 # INSTALL (once; does NOT create a server, it only installs the docker-cssh command):
 #   sudo bash vm.sh
-# v4.5
+#
 # After install:
 #   docker-cssh cr                      create a server (asks RAM / disk / CPU / bandwidth / name)
 #   docker-cssh cr -y                   create a server with defaults, no questions

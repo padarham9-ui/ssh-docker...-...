@@ -6,7 +6,7 @@
 #
 # INSTALL (once; does NOT create a server, it only installs the docker-cssh command):
 #   sudo bash vm.sh
-#
+# v4.5
 # After install:
 #   docker-cssh cr                      create a server (asks RAM / disk / CPU / bandwidth / name)
 #   docker-cssh cr -y                   create a server with defaults, no questions
@@ -743,6 +743,17 @@ fw_guard_on() {
   ipt -I FORWARD -i 'vbt+' -m comment --comment "$GUARD_COMMENT" -j DROP
 }
 
+# a settings file that is empty, from an older tool version or damaged must never reach iptables
+meta_valid() {  # NAME
+  local name=$1
+  load_meta "$name" || return 1
+  if [[ "$M_IDX" =~ ^[0-9]+$ ]] && [[ "$M_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$M_PORT" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  warn "ignoring invalid settings file $META/$name (empty or from an older version)"
+  return 1
+}
+
 # VMs are routed (one tap device each, no bridge). Rules: VMs cannot reach the host, each other,
 # private networks or the cloud metadata service; they cannot spoof addresses; abuse ports are blocked.
 # The rules are rebuilt from the saved VM settings every time (idempotent).
@@ -763,7 +774,7 @@ firewall() {
   for f in "$META"/*; do
     [ -f "$f" ] || continue
     name=${f##*/}
-    load_meta "$name" || continue
+    meta_valid "$name" || continue
     ipt -t nat -A VPSDNAT ! -i 'vbt+' -p tcp --dport "$M_PORT" -j DNAT --to-destination "$M_IP:22"
   done
   ipt -t nat -C POSTROUTING -j VPSNAT 2>/dev/null || ipt -t nat -I POSTROUTING -j VPSNAT
@@ -774,7 +785,7 @@ firewall() {
   for f in "$META"/*; do
     [ -f "$f" ] || continue
     name=${f##*/}
-    load_meta "$name" || continue
+    meta_valid "$name" || continue
     ipt -A VPSOUT -i "vbt$M_IDX" ! -s "$M_IP" -j DROP        # no address spoofing
   done
   ipt -A VPSOUT -o 'vbt+' -j DROP                            # VM -> VM is never allowed
@@ -807,7 +818,7 @@ firewall() {
   for f in "$META"/*; do
     [ -f "$f" ] || continue
     name=${f##*/}
-    load_meta "$name" || continue
+    meta_valid "$name" || continue
     ipt -A VPSIN ! -i 'vbt+' -d "$M_IP" -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT
   done
   ipt -A VPSIN -j DROP

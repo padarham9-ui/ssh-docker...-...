@@ -3,7 +3,7 @@
 # docker-cssh (VM edition): every server is a FULL, separate virtual machine (KVM + QEMU).
 # Own kernel, own virtual disk, own virtual network card. Nothing is shared with the host
 # except the CPU (through hardware virtualization).
-# v4.7
+# v5
 # INSTALL (once; does NOT create a server, it only installs the docker-cssh command):
 #   sudo bash vm.sh
 #
@@ -25,6 +25,8 @@ set -euo pipefail
 umask 022
 # a fixed PATH: this script runs as root and must not pick up programs from a caller-controlled PATH
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# a fixed locale: numbers (awk, printf, sort) must not depend on the caller's language settings
+export LC_ALL=C
 
 ENV_SUBNET="${SUBNET:-}"           # remembered: was SUBNET given explicitly by the caller?
 
@@ -348,6 +350,16 @@ check_subnet() {
 subnet_prefix() { local s=${SUBNET%/*}; echo "${s%.*}"; }
 gw_of()         { echo "${1%.*}.1"; }      # gateway of a VM address (always .1 of its /24)
 
+# warn if the VM subnet is already used by something else on this host (docker, a VPC route, ...)
+check_subnet_clash() {
+  local pre r
+  pre=$(subnet_prefix)
+  r=$(ip -4 route show 2>/dev/null | awk -v p="$pre." 'index($1, p) == 1 && $0 !~ /dev vbt/ {print $1; exit}' || true)
+  if [ -n "$r" ]; then
+    warn "the VM subnet $SUBNET overlaps a route that already exists on this host ($r). Choose another one, e.g.: SUBNET=10.99.0.0/24 sudo bash vm.sh"
+  fi
+}
+
 # the /24 the existing servers live in ("" if there are no servers)
 vm_subnet() {
   local f ip
@@ -384,6 +396,24 @@ port_used_by_vm() {  # PORT
   return 1
 }
 
+# memory of this host in MB (0 if unknown)
+host_ram_mb() {
+  local m
+  m=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || true)
+  if [[ "$m" =~ ^[0-9]+$ ]]; then echo "$m"; else echo 0; fi
+}
+
+# sum of the RAM of all existing servers in MB
+vm_ram_total_mb() {
+  local f v t=0
+  for f in "$META"/*; do
+    [ -f "$f" ] || continue
+    v=$(sed -n 's/^M_RAM_MB=//p' "$f")
+    if [[ "$v" =~ ^[0-9]+$ ]]; then t=$((t + v)); fi
+  done
+  echo "$t"
+}
+
 # ---------- interactive questions ----------
 # ask "Question" "default"  -> answer in ASK_REPLY (Enter = default; EOF = default)
 ask() {
@@ -393,12 +423,14 @@ ask() {
 }
 
 ask_ram() {
-  local v mb
+  local v mb hm
+  hm=$(host_ram_mb)
   while true; do
     ask "RAM (e.g. 512MB, 1GB, 2GB)" "$(show_size "$RAM")"
     if v=$(norm_size "$ASK_REPLY"); then
       mb=$(size_mb "$v")
       if [ "$mb" -lt 128 ]; then echo "  RAM must be at least 128MB."; continue; fi
+      if [ "$hm" -gt 0 ] && [ "$mb" -gt "$hm" ]; then echo "  This host has only ${hm}MB of RAM; choose less."; continue; fi
       if [ "$mb" -lt 512 ]; then echo "  Note: below 512MB Ubuntu will be slow and may run out of memory."; fi
       RAM=$v
       return 0
@@ -719,10 +751,14 @@ base_current() {
 }
 
 # virtual size of an image in MB (rounded up)
+# NOTE: newer qemu-img prints "virtual-size" more than once in its JSON (once for the image itself and
+# once for the underlying file), so the grep returns SEVERAL numbers. The image's own virtual size is
+# the largest one; taking only that single number avoids the "arithmetic syntax error".
 image_vsize_mb() {
   local b
-  b=$(qemu-img info --output=json "$1" 2>/dev/null | grep -o '"virtual-size": *[0-9]*' | grep -o '[0-9]*$') || return 1
-  [ -n "$b" ] || return 1
+  b=$(qemu-img info --output=json "$1" 2>/dev/null \
+      | grep -o '"virtual-size": *[0-9]*' | grep -o '[0-9]*$' | sort -n | tail -n1) || return 1
+  [[ "$b" =~ ^[0-9]+$ ]] || return 1
   echo $(( (b + 1048575) / 1048576 ))
 }
 
@@ -1030,6 +1066,7 @@ setup() {
     SUBNET=$WANT_SUBNET
   fi
   check_subnet
+  check_subnet_clash
   # firewall policy: what this run asked for (environment or the lists in this file) is saved
   BLOCK_TCP_PORTS=$WANT_BLOCK
   CONN_LIMIT=$WANT_CONN
@@ -1548,7 +1585,8 @@ sec_host() {
   sec_row "$ok" "nested virtualization hidden from guests"
   if ipt -S VPSOUT >/dev/null 2>&1; then ok=1; else ok=0; fi
   sec_row "$ok" "firewall chains VPSOUT/VPSIN (internal networks and metadata service blocked; blocked ports: $BLOCK_TCP_PORTS)"
-  if ipt -S VPSOUT 2>/dev/null | grep -q -- '--connlimit-above'; then ok=1; else ok=0; fi
+  # "grep -c" reads all of its input (no SIGPIPE problem with pipefail, unlike "grep -q")
+  if ipt -S VPSOUT 2>/dev/null | grep -c -- '--connlimit-above' >/dev/null; then ok=1; else ok=0; fi
   sec_row "$ok" "connection limit per server (CONN_LIMIT=$CONN_LIMIT; protects the shared connection table)"
   if ipt -C INPUT -i 'vbt+' -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP 2>/dev/null; then ok=1; else ok=0; fi
   sec_row "$ok" "servers cannot send anything to this host except replies"
@@ -1709,15 +1747,21 @@ cr() {
   valid_rate "$BW_UP"   || die "Invalid BW_UP value: $BW_UP (examples: 512kbit, 10mbit, off)"
   valid_rate "$BW_DOWN" || die "Invalid BW_DOWN value: $BW_DOWN (examples: 512kbit, 10mbit, off)"
 
-  local ram_mb disk_mb min_disk host_mb
+  local ram_mb disk_mb min_disk host_mb used_mb
   ram_mb=$(size_mb "$RAM")
   disk_mb=$(size_mb "$DISK")
   min_disk=$(base_min_disk_mb)
   [ "$ram_mb" -ge 128 ] || die "RAM must be at least 128MB"
   [ "$disk_mb" -ge "$min_disk" ] || die "DISK is too small: the Ubuntu image needs at least ${min_disk}MB"
-  host_mb=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || true)
-  if [[ "${host_mb:-}" =~ ^[0-9]+$ ]] && [ "$ram_mb" -gt "$host_mb" ]; then
-    die "RAM (${ram_mb}MB) is more than the memory of this host (${host_mb}MB)"
+  host_mb=$(host_ram_mb)
+  if [ "$host_mb" -gt 0 ]; then
+    if [ "$ram_mb" -gt "$host_mb" ]; then
+      die "RAM (${ram_mb}MB) is more than the memory of this host (${host_mb}MB)"
+    fi
+    used_mb=$(vm_ram_total_mb)
+    if [ $(( used_mb + ram_mb )) -gt "$host_mb" ]; then
+      warn "all servers together (${used_mb}MB existing + ${ram_mb}MB new) are more than the memory of this host (${host_mb}MB); if they all use their RAM, the host will run out of memory"
+    fi
   fi
 
   if vm_exists "$NAME"; then die "A server named $NAME already exists"; fi
@@ -1820,7 +1864,7 @@ re() {
     -y|--yes) YES=1; shift ;;
   esac
   [ "$#" -eq 1 ] || die "Usage: $CMD re [-y] NAME"
-  local NAME=$1 PORT
+  local NAME=$1 PORT min_disk disk_mb
   check_owned "$NAME"
   if ! setup_done; then
     echo "[info] setup is not complete; running it now..."
@@ -1832,6 +1876,11 @@ re() {
   [ -f "$PUBDIR/$NAME" ] || die "Could not read the SSH public key of $NAME"
   [ -f "$KEYDIR/$NAME.mgmt" ] || die "Management key of $NAME is missing"
   PORT=$M_PORT
+
+  # the newest Ubuntu image may need a bigger disk than this server has: checked BEFORE anything is wiped
+  min_disk=$(base_min_disk_mb)
+  disk_mb=$(size_mb "$M_DISK")
+  [ "$disk_mb" -ge "$min_disk" ] || die "The disk of $NAME (${disk_mb}MB) is smaller than the current Ubuntu image needs (${min_disk}MB); nothing was changed. Delete it and create a new one with a bigger disk."
 
   if [ "$YES" -eq 0 ]; then
     [ -t 0 ] || die "Refusing to wipe '$NAME' without a confirmation; run: $CMD re -y $NAME"
